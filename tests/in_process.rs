@@ -276,6 +276,54 @@ async fn mcp_full_write_lifecycle() {
     let _ = server_handle.await;
 }
 
+// ---------- 3b. Second open_* while a tx is held returns TX_ALREADY_OPEN ----------
+
+#[tokio::test]
+async fn mcp_second_open_returns_tx_already_open() {
+    if !enabled() { return; }
+    let (server_handle, client, _sessions) = connected_pair().await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!("mcp_already_open_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    setup.create_database(&db).await.unwrap();
+    let schema_tx = setup
+        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .await
+        .unwrap();
+    schema_tx
+        .query("define attribute name, value string; entity widget, owns name @card(1..1);")
+        .await
+        .unwrap();
+    schema_tx.commit().await.unwrap();
+
+    let _ = call(&client, "get_schema", serde_json::json!({"database": db})).await;
+    let r = call(&client, "open_write", serde_json::json!({"database": db})).await;
+    assert!(!is_error(&r), "first open_write succeeds");
+    let first_tx_id = envelope(&r)["session"]["transaction"]["id"]
+        .as_str()
+        .expect("tx id present")
+        .to_owned();
+
+    // Now try to open a schema tx without committing or rolling back.
+    let r = call(&client, "open_schema", serde_json::json!({"database": db})).await;
+    assert!(is_error(&r), "second open_* must be an error, not silent replacement");
+    let env = envelope(&r);
+    assert_eq!(env["error"]["class"], "TX_ALREADY_OPEN");
+    // TX_ALREADY_OPEN means the *original* tx survived untouched — the field
+    // reflects "a tx is alive and continuable," not "this call retries."
+    assert_eq!(env["error"]["retriable_in_same_tx"], true);
+    // The original write tx must still be the live one.
+    assert_eq!(env["session"]["transaction"]["id"], first_tx_id);
+    assert_eq!(env["session"]["transaction"]["kind"], "write");
+
+    let _ = call(&client, "rollback", serde_json::Value::Null).await;
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+}
+
 // ---------- 4. Parse error preserves the transaction (recoverable) ----------
 
 #[tokio::test]

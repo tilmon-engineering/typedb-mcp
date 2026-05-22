@@ -188,12 +188,13 @@ Mapping into agent-facing error classes:
 | `PARSE_ERROR`             | TypeQL syntax failure                             | **open**  |
 | `TYPE_ERROR`              | type-inference failure (unknown type, bad shape)  | **open**  |
 | `WRITE_FAILED`            | write-pipeline error                              | **gone**  |
-| `COMMIT_FAILED`           | commit-time error                                 | **gone**  |
+| `COMMIT_FAILED`           | commit-time error (markers `DCT3`/`TSV5`/`SRV19`/`HSR18`) | **gone**  |
 | `RESULT_LIMIT_EXCEEDED`   | server-side cap hit                               | **open**  |
 | `TIMEOUT`                 | server-side query timeout                         | **gone**  |
-| `UNKNOWN_DATABASE`        | database not present                              | unchanged |
+| `UNKNOWN_DATABASE`        | database not present (TypeDB `SRV3`)              | unchanged |
 | `IDLE_TIMEOUT`            | tx was reaped before this call                    | none      |
-| `UPSTREAM_UNAVAILABLE`    | TypeDB unreachable                                | session-level |
+| `UPSTREAM_UNAVAILABLE`    | TypeDB unreachable / auth failure                 | session-level |
+| `UNCLASSIFIED`            | TypeDB returned a code we don't recognize         | **gone**  |
 
 Each error response **must** include:
 
@@ -214,6 +215,44 @@ Example — fatal:
 > `email`. Your transaction has been aborted by TypeDB because the write
 > entered the data pipeline before failing. Open a new `write` transaction
 > to continue.
+
+### 5.1 Classifier strategy
+
+TypeDB defines ~70 error-code prefixes and ~300 individual codes via a
+`typedb_error!` macro scattered across ~40 `error.rs` files in the
+[`typedb/typedb`](https://github.com/typedb/typedb) repo. There is **no
+single canonical list** — to be complete you would have to scan the whole
+tree at build time. We deliberately do not.
+
+Instead, `classify_typedb_error` (in `src/error.rs`) uses a four-layer
+strategy, matched in order:
+
+1. **Structural markers in the stack** — `WEX1`/`PEX6`/`QEX14` decide
+   "write pipeline torn down → `WRITE_FAILED`"; `DCT3`/`TSV5`/`HSR18`/
+   `SRV19` decide "commit failed → `COMMIT_FAILED`". These markers
+   discriminate *fatality* regardless of which constraint (`CNT*`,
+   `DVL*`, etc.) actually fired.
+2. **Specific TSV codes** — `TSV12`/`TSV9`/`TSV8`/`TSV2`/`TSV7`. The
+   `TSV*` family is heterogeneous (commit-fatal, recoverable, dead-tx
+   marker, etc. all in one prefix), so it must be matched code-by-code.
+3. **Family prefixes** — whole families with one agent-facing class:
+   `[INF*` and `[QUA*` → `TYPE_ERROR` (recoverable); `[TQL*` → `PARSE_ERROR`
+   (recoverable); `[CNT*` and `[DVL*` → `WRITE_FAILED` (constraint or
+   validation failed outside a pipeline context).
+4. **Top-code fallback** for codes that don't show up as stack markers:
+   `TXN1`/`TXN2` → `TIMEOUT`; `SRV3` → `UNKNOWN_DATABASE`; `AUT2`/`HSR9`
+   → `UPSTREAM_UNAVAILABLE`. Anything else → `UNCLASSIFIED`.
+
+The fallback is `UNCLASSIFIED`, **not** `UPSTREAM_UNAVAILABLE`. The
+latter promises "retry once, TypeDB was unreachable" — actively
+misleading for an unrecognized code from a newer TypeDB release.
+`UNCLASSIFIED` instead carries the verbatim driver message and
+bracketed code list to the agent, tells it the transaction is gone,
+and asks the human operator to teach the classifier the new code.
+
+This means **the classifier degrades safely**: new TypeDB codes don't
+silently become bad advice. They become a labeled "I don't know" that
+the agent can surface and a human can fix in one place (`src/error.rs`).
 
 ---
 
@@ -260,7 +299,17 @@ Notes:
   reaped tx.
 - `typedb_codes` are surfaced raw for debugging and for sophisticated agents
   that want to introspect; they are not the primary signal.
-- `retriable_in_same_tx` is the boolean form of §5's "Tx survives?" column.
+- `retriable_in_same_tx` is the boolean form of §5's "Tx after" column.
+  Precise meaning: **`true` iff a transaction remains open and continuable
+  after this error**. It does *not* mean "you can retry the failing call
+  as-is" — for `TX_IS_READ` and `TX_ALREADY_OPEN` the field is `true`
+  because the underlying tx is alive (consult `next_moves` for what to do
+  with it), even though the specific call that failed will keep failing
+  the same way until you change something. `false` covers both "no tx
+  existed" (`NO_TX_OPEN`, `SCHEMA_NOT_READ`, `UNKNOWN_DATABASE`, …) and
+  "the tx was torn down" (`WRITE_FAILED`, `COMMIT_FAILED`, `TIMEOUT`,
+  `IDLE_TIMEOUT`). Mapping: `unchanged` + `open` → `true`; `none` + `gone`
+  + `session-level` → `false`.
 
 ---
 

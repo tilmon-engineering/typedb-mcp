@@ -206,6 +206,7 @@ must open a new one. Results are capped (see config); paginate with \
             ));
         };
         let kind = tx.kind;
+        let database = tx.database.clone();
         tx.last_activity = Instant::now();
 
         let answer_result = tx.transaction.query(&p.query).await;
@@ -237,7 +238,7 @@ must open a new one. Results are capped (see config); paginate with \
                         }
                         drop(state);
                         let snap = self.sessions.snapshot(&sid).await;
-                        Ok(envelope_ok(snap, value, next_moves::after_query_ok(kind)))
+                        Ok(envelope_ok(snap, value, next_moves::after_query_ok(kind, &database)))
                     }
                     Err(e) => {
                         // Stream error mid-results: treat as a driver error,
@@ -330,7 +331,10 @@ for the affected database.")]
                 Ok(envelope_err(
                     snap,
                     internal,
-                    "Commit failed. No changes were persisted; the transaction has been closed.",
+                    "Commit failed. The transaction has been closed and NO changes were \
+                     persisted — including any uncommitted inserts/updates from earlier \
+                     queries in this tx. Any concept IIDs in the upstream details below \
+                     refer to never-committed state and cannot be looked up in a fresh tx.",
                     next_moves::on_error(class, Some(&database)),
                 ))
             }
@@ -610,15 +614,20 @@ mod next_moves {
         ]
     }
 
-    pub fn after_query_ok(kind: TxKind) -> Vec<String> {
-        let close = match kind {
-            TxKind::Read => "Close with `rollback` when done (READ transactions cannot be committed).",
-            TxKind::Write => "End with `commit` to persist, or `rollback` to discard.",
-            TxKind::Schema => "End with `commit` to persist the schema change (which will clear the schema-read gate), or `rollback` to discard.",
+    pub fn after_query_ok(kind: TxKind, db: &str) -> Vec<String> {
+        let close: String = match kind {
+            TxKind::Read => "Close with `rollback` when done (READ transactions cannot be committed).".into(),
+            TxKind::Write => "End with `commit` to persist, or `rollback` to discard.".into(),
+            TxKind::Schema => format!(
+                "End with `commit` to persist the schema change (which will CLEAR the \
+                 schema-read gate for `{db}` — you'll need to call \
+                 `get_schema(database=\"{db}\")` again before opening further \
+                 transactions on it), or `rollback` to discard."
+            ),
         };
         vec![
             "Continue with more `query` calls on the same transaction if needed.".into(),
-            close.into(),
+            close,
         ]
     }
 
@@ -697,10 +706,13 @@ mod next_moves {
             ],
             WriteFailed => vec![
                 "The transaction has been ABORTED by TypeDB. Open a new transaction \
-                 (typically `open_write`) to continue.".into(),
-                "Before retrying the failing write, consider re-reading the schema \
-                 (`get_schema`) or the relevant data — the constraint that fired tells \
-                 you something about reality you may not have known.".into(),
+                 (typically `open_write`) to continue. The schema-read gate is still \
+                 valid (no schema change happened), so you do NOT need to call \
+                 `get_schema` again before the next `open_*`.".into(),
+                "Before retrying the failing write, consider re-reading the relevant \
+                 *data* (the constraint that fired tells you something about reality \
+                 you may not have known). Re-reading the schema is optional — useful \
+                 only if you suspect you misremembered a constraint shape.".into(),
             ],
             CommitFailed => vec![
                 "The transaction is closed and no changes were persisted. Open a new \
@@ -722,6 +734,16 @@ mod next_moves {
                 "Call `list_databases` to see the available database names.".into(),
             ],
             UpstreamUnavailable => on_upstream_unavailable(),
+            Unclassified => vec![
+                "Assume the transaction (if any) is gone. Open a new one with \
+                 `open_read` / `open_write` / `open_schema` if you intend to continue.".into(),
+                "The full TypeDB error is preserved verbatim in `error.message` (after \
+                 `(details: ...)`), and every bracketed upstream code is in \
+                 `error.typedb_codes` — quote them when reporting to the human operator.".into(),
+                "If this class recurs, escalate: it likely means TypeDB introduced a new \
+                 error code post-dating this server's classifier, and someone needs to \
+                 update `classify_typedb_error` in `src/error.rs` to recognize it.".into(),
+            ],
         }
     }
 }
@@ -826,13 +848,21 @@ fn explain_query_error(class: ErrorClass) -> String {
         ErrorClass::WriteFailed =>
             "Write failed and the transaction has been aborted by TypeDB. Open a new transaction to continue.".into(),
         ErrorClass::CommitFailed =>
-            "Commit-time validation failed; the transaction is closed and no changes were persisted.".into(),
+            "Commit-time validation failed; the transaction is closed and no changes were \
+             persisted (any concept IIDs in the upstream details refer to never-committed state).".into(),
         ErrorClass::ResultLimitExceeded =>
             "Result set exceeded the server-side cap. Re-issue with `sort $k; offset N; limit M;` (offset MUST come before limit).".into(),
         ErrorClass::Timeout =>
             "Server-side query timeout; the transaction is closed.".into(),
         ErrorClass::IdleTimeout =>
             "Your transaction was closed (idle reaper or prior write error). Open a new one to continue.".into(),
+        ErrorClass::Unclassified =>
+            "TypeDB returned an error this MCP server does not recognize — most likely a code \
+             introduced in a newer TypeDB release than this server was built against. The \
+             VERBATIM driver message is included in the details below, and every bracketed \
+             code from the stack is in `error.typedb_codes`. Treat any open transaction as \
+             gone; surface this to the human operator if it recurs (it may indicate the \
+             classifier needs updating).".into(),
         _ => "Query failed; see error details.".into(),
     }
 }

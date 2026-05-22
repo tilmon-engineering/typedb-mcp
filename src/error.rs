@@ -44,16 +44,42 @@ pub enum ErrorClass {
     IdleTimeout,
     /// TypeDB server unreachable / auth failure / generic upstream problem.
     UpstreamUnavailable,
+    /// TypeDB returned an error this server does not know how to classify.
+    /// Conservatively treated as fatal to any open transaction (we lack
+    /// the information to claim otherwise). Most likely cause: a newer
+    /// TypeDB release introduced an error code post-dating this
+    /// classifier. The full driver message is preserved verbatim in the
+    /// envelope's `error.message` and the bracketed codes in
+    /// `error.typedb_codes` for human follow-up.
+    Unclassified,
 }
 
 impl ErrorClass {
-    /// Whether the open transaction (if any) survives this error.
-    /// Maps the "Tx survives?" column in DESIGN.md §5.
+    /// Whether a transaction remains open and continuable after this error.
+    ///
+    /// `true` for both the recoverable-query family (where the query failed
+    /// but the tx is intact — fix and retry) AND the no-op-on-existing-tx
+    /// family (`TX_IS_READ`, `TX_ALREADY_OPEN` — the failing *call* cannot
+    /// be retried as-is, but the underlying tx is alive and you can keep
+    /// using it; see the response's `next_moves` for what to do instead).
+    ///
+    /// `false` when there is no live tx after this error: either none
+    /// existed (`NO_TX_OPEN`, `SCHEMA_NOT_READ`, `UNKNOWN_DATABASE` etc.)
+    /// or one was torn down by it (`WRITE_FAILED`, `COMMIT_FAILED`,
+    /// `TIMEOUT`, `IDLE_TIMEOUT`).
+    ///
+    /// Maps the "Tx after" column in DESIGN.md §5 to a boolean:
+    /// `unchanged` and `open` → `true`; `none`, `gone`, `session-level` → `false`.
     pub fn retriable_in_same_tx(self) -> bool {
         use ErrorClass::*;
         matches!(
             self,
-            WrongTxType | ParseError | TypeError | ResultLimitExceeded
+            WrongTxType
+                | ParseError
+                | TypeError
+                | ResultLimitExceeded
+                | TxIsRead
+                | TxAlreadyOpen
         )
     }
 }
@@ -62,17 +88,44 @@ impl ErrorClass {
 ///
 /// The TypeDB HTTP API returns errors as JSON `{ "code": "...", "message": "..." }`
 /// where `message` contains a stack of bracketed codes — e.g.
-/// `[CNT6] ... [WEX1] ... [TSV11] [HSR16]`.
+/// `[CNT6] ... [WEX1] ... [TSV11] [HSR16]`. The gRPC driver renders the
+/// same stack via the `Server` error's `Display`.
+///
+/// **Strategy: structural markers, then specific codes, then family prefixes,
+/// then a conservative fallback.** TypeDB has 70+ code prefixes and 300+
+/// individual codes (see `DESIGN.md` §5 for the source of truth). We do
+/// not enumerate them all — that list drifts every release. Instead we
+/// match on the small set of *structural* codes that decide lifecycle
+/// outcome (`WEX1`/`PEX6`/`QEX14` mean "write pipeline torn down,"
+/// `DCT3`/`TSV5`/`HSR18`/`SRV19` mean "commit failed," etc.) and let
+/// whole code families collapse to the same agent-facing class
+/// (`[INF*` and `[QUA*` are all type/inference issues → `TypeError`;
+/// `[TQL*` is all TypeQL parse → `ParseError`; `[CNT*` and `[DVL*` are
+/// constraint/validation failures → `WriteFailed`).
+///
+/// Anything we cannot map ends in `Unclassified` — *not*
+/// `UpstreamUnavailable`. The latter promises "retry once, TypeDB was
+/// unreachable," which would be a lie for unrecognized codes from a new
+/// TypeDB release. `Unclassified` carries the verbatim driver message
+/// to the agent and tells it the transaction is gone.
 pub fn classify_typedb_error(top_code: &str, message: &str) -> ErrorClass {
-    // Order matters: write-pipeline before parse/compile, because a constraint
-    // violation also carries `TSV11`, but its presence of `WEX1` / `PEX6` /
-    // `QEX14` is the discriminator (see DESIGN.md §5).
+    // 1. Structural markers — these decide lifecycle.
+    //    Order matters: a constraint violation (CNT*) ALSO carries WEX1 in
+    //    the stack on a write-pipeline failure, so the write-pipeline marker
+    //    must win first.
     if message.contains("[WEX1]") || message.contains("[PEX6]") || message.contains("[QEX14]") {
         return ErrorClass::WriteFailed;
     }
-    if message.contains("[DCT3]") || message.contains("[TSV5]") || message.contains("[HSR18]") {
+    if message.contains("[DCT3]")
+        || message.contains("[TSV5]")
+        || message.contains("[HSR18]")
+        || message.contains("[SRV19]")
+    {
         return ErrorClass::CommitFailed;
     }
+
+    // 2. Specific TSV codes (heterogeneous family — must be matched
+    //    individually, not as `[TSV*` prefix).
     if message.contains("[TSV12]") {
         // "Operation failed: no open transaction." Means the tx was reaped
         // or aborted between calls; the *session* still exists.
@@ -84,23 +137,31 @@ pub fn classify_typedb_error(top_code: &str, message: &str) -> ErrorClass {
     if message.contains("[TSV2]") {
         return ErrorClass::TxIsRead;
     }
-    if message.contains("[TQL03]") || message.contains("[TSV7]") {
+    if message.contains("[TSV7]") {
         return ErrorClass::ParseError;
     }
-    if message.contains("[INF2]") || message.contains("[QUA1]") || message.contains("[QEX8]") {
+
+    // 3. Family prefixes — whole code families with one agent-facing class.
+    //    Must come after specific codes above, before the fallback below.
+    if message.contains("[TQL") {
+        return ErrorClass::ParseError;
+    }
+    if message.contains("[INF") || message.contains("[QUA") {
         return ErrorClass::TypeError;
     }
+    if message.contains("[CNT") || message.contains("[DVL") {
+        // Constraint/validation failure that didn't fire the WEX/DCT markers
+        // above. Treat as fatal: a constraint or validator returned a no on
+        // some write/define action.
+        return ErrorClass::WriteFailed;
+    }
 
-    // Fallback by top code if message inspection missed something.
+    // 4. Fallback by top code for things that don't show in stack markers.
     match top_code {
-        "CNT5" | "CNT6" | "CNT7" | "CNT8" => ErrorClass::WriteFailed,
-        "TSV9" | "TSV8" => ErrorClass::WrongTxType,
-        "TSV2" => ErrorClass::TxIsRead,
-        "TSV12" => ErrorClass::IdleTimeout,
-        "TQL0" => ErrorClass::ParseError,
-        "INF2" => ErrorClass::TypeError,
+        "TXN1" | "TXN2" => ErrorClass::Timeout,
+        "SRV3" => ErrorClass::UnknownDatabase,
         "AUT2" | "HSR9" => ErrorClass::UpstreamUnavailable,
-        _ => ErrorClass::UpstreamUnavailable,
+        _ => ErrorClass::Unclassified,
     }
 }
 
@@ -211,6 +272,172 @@ mod tests {
         );
         assert_eq!(c, ErrorClass::WrongTxType);
         assert!(c.retriable_in_same_tx());
+    }
+
+    // --- Family-prefix tests ---------------------------------------------
+
+    #[test]
+    fn any_inf_code_is_type_error() {
+        // INF7 isn't in our specific list; the family prefix must still catch it.
+        let c = classify_typedb_error(
+            "INF7",
+            "[INF7] Some new inference failure introduced in TypeDB 3.12.",
+        );
+        assert_eq!(c, ErrorClass::TypeError);
+        assert!(c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn any_qua_code_is_type_error() {
+        let c = classify_typedb_error(
+            "QUA12",
+            "[QUA12] Annotation error: some new annotation failure.",
+        );
+        assert_eq!(c, ErrorClass::TypeError);
+        assert!(c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn any_tql_code_is_parse_error() {
+        // Even if TypeDB introduces a TQL99 we've never seen, ParseError is right.
+        let c = classify_typedb_error(
+            "TQL99",
+            "[TQL99] Some hypothetical new TypeQL parse failure.",
+        );
+        assert_eq!(c, ErrorClass::ParseError);
+        assert!(c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn cnt_alone_is_write_failed() {
+        // CNT* outside the WEX/DCT contexts (e.g. caught by a validator before
+        // the write pipeline runs). Still fatal-shaped.
+        let c = classify_typedb_error(
+            "CNT9",
+            "[CNT9] Constraint '@distinct' violated (hypothetical).",
+        );
+        assert_eq!(c, ErrorClass::WriteFailed);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn dvl_alone_is_write_failed() {
+        let c = classify_typedb_error(
+            "DVL3",
+            "[DVL3] Data validation failed for some new reason.",
+        );
+        assert_eq!(c, ErrorClass::WriteFailed);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    // --- Specific code additions ----------------------------------------
+
+    #[test]
+    fn txn1_is_timeout() {
+        let c = classify_typedb_error(
+            "TXN1",
+            "[TXN1] Transaction exceeded its configured timeout.",
+        );
+        assert_eq!(c, ErrorClass::Timeout);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn txn2_is_timeout() {
+        let c = classify_typedb_error(
+            "TXN2",
+            "[TXN2] Write exclusivity acquisition timed out.",
+        );
+        assert_eq!(c, ErrorClass::Timeout);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    // --- Conservative fallback ------------------------------------------
+
+    #[test]
+    fn unrecognized_code_is_unclassified_not_upstream() {
+        // A code from some future TypeDB release we've never seen.
+        // Must NOT classify as UpstreamUnavailable (which would tell the
+        // agent to retry once — wrong for a structural error).
+        let c = classify_typedb_error(
+            "XYZ99",
+            "[XYZ99] Some entirely new error category in TypeDB 4.0.",
+        );
+        assert_eq!(c, ErrorClass::Unclassified);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn unrecognized_code_with_no_markers_in_message_is_unclassified() {
+        // No structural marker, no family prefix, no fallback top-code match.
+        let c = classify_typedb_error("???", "Some bare error string with no [BRACKETED] codes.");
+        assert_eq!(c, ErrorClass::Unclassified);
+    }
+
+    // --- Order-sensitivity regression -----------------------------------
+
+    #[test]
+    fn cnt_inside_write_pipeline_stack_is_write_failed_not_just_cnt() {
+        // WEX1 in the stack must win over the bare [CNT family check;
+        // the agent advice is the same (WriteFailed both ways) but the
+        // classifier is making the correct discrimination.
+        let c = classify_typedb_error(
+            "CNT6",
+            "[CNT6] Constraint @regex violated.\n[WEX1] write pipeline failed.",
+        );
+        assert_eq!(c, ErrorClass::WriteFailed);
+    }
+
+    #[test]
+    fn cnt_inside_commit_stack_is_commit_failed_not_write_failed() {
+        // DCT3/SRV19 in the stack must win over the bare [CNT family check.
+        // The discrimination matters: WriteFailed says "your insert failed
+        // mid-transaction," CommitFailed says "your insert was fine, the
+        // commit caught a violation across the whole tx state."
+        let c = classify_typedb_error(
+            "CNT5",
+            "[CNT5] Constraint @card violated.\n[DCT3] data commit error.\n[SRV19] commit failed.",
+        );
+        assert_eq!(c, ErrorClass::CommitFailed);
+    }
+
+    #[test]
+    fn srv19_alone_is_commit_failed() {
+        // Defensive: today TypeDB always emits SRV19 alongside DCT3/TSV5.
+        // If a future version ever drops the trio but keeps SRV19, we
+        // still want to classify it as a commit-time failure rather than
+        // falling through to UPSTREAM_UNAVAILABLE.
+        let c = classify_typedb_error(
+            "CNT5",
+            "[CNT5] Constraint violated.\n[SRV19] Data commit failed.",
+        );
+        assert_eq!(c, ErrorClass::CommitFailed);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn tx_is_read_keeps_tx_alive() {
+        // `commit` on a read tx is caught at the handler before reaching
+        // TypeDB, but `retriable_in_same_tx` still has to reflect reality:
+        // the tx is open and reusable (for more reads, or rollback).
+        assert!(ErrorClass::TxIsRead.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn tx_already_open_means_original_tx_survives() {
+        // The whole point of TX_ALREADY_OPEN is that the existing tx was
+        // untouched — the failing `open_*` never replaced it.
+        assert!(ErrorClass::TxAlreadyOpen.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn srv3_means_unknown_database() {
+        let c = classify_typedb_error(
+            "SRV3",
+            "[SRV3] Database 'definitely_not_a_real_db_lol' not found.",
+        );
+        assert_eq!(c, ErrorClass::UnknownDatabase);
+        assert!(!c.retriable_in_same_tx());
     }
 
     #[test]
