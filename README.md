@@ -72,38 +72,43 @@ for both.
 
 ### Attention stacking
 
-The same principle applies to nested wrappers:
+A related cost is what we'll call *attention stacking*: the implicit
+dimensional context that conversation participants are expected to
+silently track on each other's behalf.
 
-> An error occurred while handling a request: an error occurred while
-> performing operation Y on object Z: an error occurred in subsystem W:
-> ...
+Consider a sentence like "the Publisher API is slow." Real systems have
+many dimensions along which "the Publisher API" might vary — preprod or
+prod, region, internal or external endpoint, current release or the
+canary, this tenant or that one. The sentence fixes none of those
+dimensions explicitly. To act on it, every reader has to consult a
+running mental model of the conversation so far and decide which
+dimensions are pinned, which are still variable, and which were pinned
+several turns ago and might have drifted since. That running model is
+the stack; using it is the attention cost.
 
-Each `an error occurred while` is a frame the reader has to push onto a
-mental stack before they reach the actual claim. By the time the reader
-hits the leaf, they have to pop frames back up to relate the leaf to the
-original call. For a human this is fatiguing; for an agent it is
-fatiguing *and* lossy, because the model has to hold the stack in working
-context while doing the rest of its reasoning.
+Humans pay this cost reasonably well over short conversations, with
+people they know, in domains they're current on. The cost rises sharply
+when any of those conditions weaken — new participant, long thread,
+unfamiliar subsystem. Agents pay this cost on every single turn, with
+no continuity beyond the literal text in their context, and the failure
+mode when the stack mis-resolves is not "ask a clarifying question" but
+"confidently act on the wrong referent."
 
-The fix is the same in both cases: state the operation and the object
-once, plainly, at the top of the message, and put the leaf cause inline
-rather than wrapping it. A response should read top-down, not
-inside-out.
+Pronouns are the densest case of the same phenomenon. "It calls the API
+and then it returns the result, which it then passes to the handler"
+has three `it`s with three different referents; resolving each one
+requires the reader to walk back through prior context and pick the
+right antecedent. Drop the pronouns and the indirection drops with
+them.
 
-### Pronouns and un-qualified references
-
-A related failure mode is excessive pronouns and ambiguous referents in
-documentation, prompts, and inter-system messages. "It calls the API and
-then it returns the result, which it then passes to the handler" contains
-three `it`s with three different referents. A human reader can usually
-disambiguate from context with effort. An agent often cannot, and silent
-mis-resolution shows up downstream as confidently wrong code.
-
-The mitigation is mechanical: when writing for a system that involves
-multiple actors and objects, rewrite sentences to use the
-fully-qualified noun every time. The prose gets longer; the indirection
-budget drops to zero. That is the right trade for anything an agent will
-read.
+The mitigation is mechanical and slightly tedious: when writing for a
+system that involves multiple actors, environments, or objects, fully
+qualify the reference every time. Not "the Publisher API" but "the
+preprod Publisher API in `us-east-1`". Not "it returns the result" but
+"`fetch_user` returns the `User` record". The prose gets longer. The
+attention budget drops to near zero. For anything an agent will read,
+and for any technical conversation that crosses more than two
+participants or more than ten minutes, that is the right trade.
 
 ### How those principles show up in this server
 
