@@ -322,6 +322,9 @@ full per-tool catalogue of hints and the rationale.
 
 ```yaml
 session:
+  session_id: 6ee0c8b9-...      # the server-issued ID this snapshot belongs to;
+                                # omitted entirely on SESSION_UNKNOWN/SESSION_EXPIRED
+                                # errors where no session was resolved
   database: agents | null
   transaction:                  # null if no tx open
     id: tx_a8c1                 # short opaque correlation id (not the TypeDB UUID)
@@ -329,14 +332,20 @@ session:
     state: open                 # open is the only externally observable state
   schema_seen_for: [agents]     # databases whose schema this session has read
 next_moves:
-  - "Call `get_schema(database=<name>)` for any database before querying it."
+  - "Call `get_schema(session_id=..., database=<name>)` for any database before querying it."
 result: ...                     # or
 error:
-  class: WRITE_FAILED
+  class: WRITE_FAILED           # or SESSION_UNKNOWN / SESSION_EXPIRED, etc.
   message: "..."                # already lifecycle-aware, see §5
   typedb_codes: [CNT6, DVL7, COW5, WEX1, PEX6, QEX14, TSV11, HSR16]
   retriable_in_same_tx: false   # convenience flag the agent can act on without parsing prose
 ```
+
+The `start_session` response is the one tool whose `result` block also
+carries the session_id explicitly (alongside `expires_in_seconds` and
+`databases`), since it's the canonical way the agent learns the ID it
+needs to thread through subsequent calls. Every other tool's response
+puts the ID in `session.session_id` only.
 
 `next_moves` is intentionally not a single string — multiple valid next
 operations exist at most states, and the agent should see all of them.

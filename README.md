@@ -5,35 +5,55 @@ server that exposes a [TypeDB 3.11+](https://typedb.com) database to an LLM
 agent. Written in Rust, built on the official `typedb-driver` (gRPC) and
 the `rmcp` SDK.
 
-This is an independent reimplementation of the official
-[`typedb/typedb-mcp`](https://github.com/typedb/typedb-mcp) Python server.
-At the MCP transport layer it is a drop-in replacement — same port, same
-URL path, same tool surface — but the design has a tighter safety thesis.
+This is an independent reimplementation, in Rust on gRPC, of the
+official [`typedb/typedb-mcp`](https://github.com/typedb/typedb-mcp)
+Python (HTTP) server. The transport URL (`/mcp` on the configured port)
+and the broad shape of the tool surface match upstream's intent, but
+**this is not a drop-in replacement**:
+
+1. The tool surface diverges in shape: this server adds `start_session`
+   as the entry point, and **every other tool requires a `session_id`
+   argument** (see `DESIGN.md` §3 and §7). Existing clients written
+   against the upstream Python server will need to thread `session_id`
+   through every call.
+2. The lifecycle is gated: schema must be read before a transaction can
+   be opened on a database, only one transaction is open at a time, and
+   the response envelope is structured (`session`, `next_moves`,
+   `result` / `error`).
+3. The TypeDB endpoint is gRPC (default `:1729`), not the HTTP API
+   (`:8000`) the upstream Python server uses.
+
 See [`DESIGN.md`](DESIGN.md) for the full contract.
 
 ## What's different from the upstream server
 
-- **Connection-bound transaction model.** The agent must call `get_schema`
-  before opening a transaction, and every response carries `next_moves`
-  telling it what calls are valid next. The state machine is small, but
-  it is explicit.
+- **Server-issued sessions are the state-machine root.** Call
+  `start_session` first; pass the returned `session_id` to every other
+  tool. Sessions outlive the MCP transport session (a deliberate choice
+  — see `DESIGN.md` §3 for the LiteLLM-gateway interop story that drove
+  it). Default TTL is 60 minutes of inactivity, refreshed on every
+  resolve.
+- **Connection-bound transaction model.** Within a session, the agent
+  must call `get_schema` before opening a transaction, and every
+  response carries `next_moves` telling it what calls are valid next.
+  The state machine is small, but it is explicit.
 - **Lifecycle-aware errors.** Every error tells the agent whether the
   open transaction is still alive (`error.retriable_in_same_tx`). The
   classification was probed empirically against TypeDB CE 3.10.4 (HTTP)
   and 3.11.1 (gRPC); see `DESIGN.md` §5.
 - **gRPC, not HTTP.** We use the official `typedb-driver` crate, which
   speaks gRPC on port `1729`. The upstream Python server speaks HTTP on
-  port `8000`. This is the one place the "drop-in" framing breaks: point
-  the container at the TypeDB **gRPC** endpoint.
+  port `8000`. Point the container at the TypeDB **gRPC** endpoint.
 
 > **TypeDB version requirement.** This server requires **TypeDB 3.11.0
 > or newer**. Earlier 3.x releases are not supported — deployment
 > against 3.10.x and below has been observed to fail at the driver
 > layer.
 
-The MCP-facing surface (nine tools, served over Streamable HTTP at
-`/mcp`) matches upstream's intent. The wire-level behaviour is
-intentionally stricter.
+The MCP-facing surface is ten tools served over Streamable HTTP at
+`/mcp` (or stdio for local clients):
+`start_session`, `list_databases`, `get_schema`, `open_read`,
+`open_write`, `open_schema`, `query`, `commit`, `rollback`, `read_once`.
 
 ## Theory: agent affordances are user affordances
 
@@ -183,6 +203,34 @@ TypeDB running on the host.
 A leading `http://` on `--typedb-address` is stripped for compatibility
 with copy-pasted upstream commands, but the port must still point at gRPC.
 
+### `config.toml` extras
+
+A handful of knobs are only reachable via the config file (`config.toml`
+in CWD, or `TYPEDB_MCP_CONFIG=/path/to/config.toml`):
+
+```toml
+[server]
+session_ttl_s  = 3600                 # SessionStore entry TTL (default 60 min)
+idle_timeout_s = 60                   # tx-idle reaper (default 60 s)
+result_cap     = 500                  # max answers per query response
+
+# Streamable HTTP Host-header allowlist. Omit to keep rmcp's loopback
+# default (localhost, 127.0.0.1, ::1) — fine for local stdio-style use.
+# Extend for Kubernetes Service DNS / Ingress hostnames:
+# allowed_hosts = ["typedb-mcp.typedb.svc:8001", "typedb-mcp.example.com"]
+# Or `[]` to disable the check entirely (only if upstream network
+# isolation is enforced); logs WARN on startup if you do.
+```
+
+### Kubernetes / behind an Ingress
+
+By default the Streamable HTTP transport only accepts requests whose
+`Host` header is `localhost`, `127.0.0.1`, or `::1` (rmcp's
+DNS-rebinding defense). In-cluster Service DNS and Ingress hostnames
+are rejected with a `403 Forbidden: Host header is not allowed`. Set
+`server.allowed_hosts` in `config.toml` to extend the allowlist; see
+the snippet above.
+
 ### Wiring an MCP client
 
 Point your client at `http://<host>:8001/mcp`. For Cursor:
@@ -194,6 +242,34 @@ Point your client at `http://<host>:8001/mcp`. For Cursor:
   }
 }
 ```
+
+### Tool flow (agent's-eye view)
+
+The expected call sequence for a write-and-verify task:
+
+```
+start_session()
+  -> { session_id: "abc…", databases: [...] }
+
+get_schema(session_id, database)
+  -> arms the schema-read gate for that database
+
+open_write(session_id, database)
+  -> transaction is now open
+
+query(session_id, query="insert ...")
+  -> insert lands inside the open tx; not yet persisted
+
+commit(session_id)
+  -> writes durable
+
+read_once(session_id, database, query="match ...")
+  -> verify
+```
+
+Any tool other than `start_session` returns `SESSION_UNKNOWN` or
+`SESSION_EXPIRED` if `session_id` does not resolve; the response's
+`next_moves` directs the agent to call `start_session` and reissue.
 
 ## Running from source
 
