@@ -75,10 +75,27 @@ async fn main() -> Result<()> {
         // instance, but they all share the same TypeDB client and the
         // same SessionStore — so our schema-read gate and tx state are
         // tracked per agent session, not per process.
+        let mut http_cfg =
+            StreamableHttpServerConfig::default().with_cancellation_token(ct_for_service);
+        if let Some(hosts) = &config.server.allowed_hosts {
+            if hosts.is_empty() {
+                tracing::warn!(
+                    "server.allowed_hosts = []: Host-header check disabled; \
+                     relying on network-level isolation"
+                );
+                http_cfg = http_cfg.disable_allowed_hosts();
+            } else {
+                tracing::info!(
+                    allowed_hosts = ?hosts,
+                    "Streamable HTTP Host-header allowlist overridden by config"
+                );
+                http_cfg = http_cfg.with_allowed_hosts(hosts.iter().cloned());
+            }
+        }
         let service = StreamableHttpService::new(
             move || Ok(TypeDbMcp::new(config_h.clone(), typedb_h.clone(), sessions_h.clone())),
             LocalSessionManager::default().into(),
-            StreamableHttpServerConfig::default().with_cancellation_token(ct_for_service),
+            http_cfg,
         );
         let router = axum::Router::new().nest_service("/mcp", service);
 

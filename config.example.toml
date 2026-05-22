@@ -3,6 +3,13 @@ idle_timeout_s = 60
 result_cap     = 500
 listen_stdio   = true
 # listen_http  = "127.0.0.1:8765"     # not yet wired (see DESIGN.md §11)
+# Host-header allowlist for the HTTP transport. Default (when omitted) is
+# rmcp's loopback set ["localhost", "127.0.0.1", "::1"] — fine for local
+# stdio-style use, but rejects K8s Service DNS and Ingress hostnames.
+# Extend it for in-cluster deployments:
+# allowed_hosts = ["typedb-mcp.typedb.svc:8001", "typedb-mcp.example.com"]
+# Or disable the check entirely (only if upstream network isolation is enforced):
+# allowed_hosts = []
 
 [typedb]
 address     = "127.0.0.1:1729"        # gRPC host:port; no scheme

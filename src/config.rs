@@ -23,6 +23,16 @@ pub struct ServerConfig {
     /// `host:port` to bind the Streamable HTTP transport, or `None` to disable.
     #[serde(default)]
     pub listen_http: Option<String>,
+    /// Host-header allowlist for the Streamable HTTP transport. Defaults to
+    /// `["localhost", "127.0.0.1", "::1"]` (rmcp's loopback-only default,
+    /// which mitigates DNS rebinding against local stdio-style deployments).
+    /// Operators deploying behind a Service / Ingress / reverse proxy must
+    /// extend this with the externally-visible authority (e.g.
+    /// `typedb-mcp.example.svc:8001`). An empty list (`[]`) disables the
+    /// check entirely — only safe when network-level isolation is enforced
+    /// elsewhere.
+    #[serde(default)]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
