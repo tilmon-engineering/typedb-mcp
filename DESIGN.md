@@ -266,7 +266,7 @@ Notes:
 
 ## 7. Tool surface
 
-Eight tools.
+Nine tools.
 
 ### 7.1 `list_databases`
 
@@ -439,12 +439,16 @@ refresh — that is the driver's responsibility.
 
 ## 11. Open work tracked against this design
 
-- Implementation: bootstrap a Rust crate, wire `rmcp`, implement the eight
-  tools and the session-state machine.
 - Empirical: verify TypeDB behaviour under concurrent sessions hitting the
   same database (issue #6146 hints at concurrent-request error confusion).
 - Empirical: verify that closing a session in `rmcp` (stdio EOF, HTTP session
   expiry) reliably triggers our session-state cleanup so we do not leak
-  transactions on the TypeDB side.
+  transactions on the TypeDB side. The idle reaper backstops this, but the
+  prompt-cleanup path on session close has not been exercised end-to-end.
 - Decide: whether to surface per-query `warning` from TypeDB to the agent
   inside `result`, or merge it into the error envelope.
+- Audit logging: the operator config field exists; the writer is not
+  implemented.
+- Integration test that drives the MCP tools through an in-process rmcp
+  client → server pair, end-to-end (we have driver-level smoke and
+  transport-level smoke, but no test crossing both).

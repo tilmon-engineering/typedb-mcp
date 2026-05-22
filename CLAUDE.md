@@ -75,7 +75,7 @@ drift.
 ## Boundaries
 
 - Safe to edit: `src/`, `DESIGN.md`, `CLAUDE.md`, `Cargo.toml`.
-- The eight tools enumerated in `DESIGN.md` §7 are the entire agent-facing
+- The nine tools enumerated in `DESIGN.md` §7 are the entire agent-facing
   surface. Adding a ninth tool is a design change, not an implementation
   change — update `DESIGN.md` first.
 

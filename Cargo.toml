@@ -27,6 +27,7 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 futures = "0.3"
+tokio-util = "0.7"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

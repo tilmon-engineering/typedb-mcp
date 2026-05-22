@@ -1,0 +1,14 @@
+[server]
+idle_timeout_s = 60
+result_cap     = 500
+listen_stdio   = false
+listen_http    = "127.0.0.1:8765"
+
+[typedb]
+address     = "127.0.0.1:1729"
+tls_enabled = false
+
+[typedb.credentials]
+source   = "inline"
+username = "admin"
+password = "password"

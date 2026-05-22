@@ -3,7 +3,17 @@
 use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
-use rmcp::{ServiceExt, transport::stdio};
+use rmcp::{
+    ServiceExt,
+    transport::{
+        stdio,
+        streamable_http_server::{
+            StreamableHttpServerConfig, StreamableHttpService,
+            session::local::LocalSessionManager,
+        },
+    },
+};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 use typedb_mcp::{
@@ -48,24 +58,85 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { run_idle_reaper(s, idle).await });
     }
 
-    if let Some(addr) = &config.server.listen_http {
-        tracing::warn!(
-            addr = %addr,
-            "Streamable HTTP transport is configured but not yet wired; running stdio only"
+    let shutdown = CancellationToken::new();
+
+    // Streamable HTTP transport (optional, opt-in via config).
+    let http_task = if let Some(addr) = &config.server.listen_http {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        tracing::info!(addr = %local_addr, "Streamable HTTP transport listening at /mcp");
+
+        let config_h = config.clone();
+        let typedb_h = typedb.clone();
+        let sessions_h = sessions.clone();
+        let ct_for_service = shutdown.child_token();
+
+        // Per-MCP-session factory: each session gets its own handler
+        // instance, but they all share the same TypeDB client and the
+        // same SessionStore — so our schema-read gate and tx state are
+        // tracked per agent session, not per process.
+        let service = StreamableHttpService::new(
+            move || Ok(TypeDbMcp::new(config_h.clone(), typedb_h.clone(), sessions_h.clone())),
+            LocalSessionManager::default().into(),
+            StreamableHttpServerConfig::default().with_cancellation_token(ct_for_service),
         );
+        let router = axum::Router::new().nest_service("/mcp", service);
+
+        let ct_for_axum = shutdown.clone();
+        Some(tokio::spawn(async move {
+            let result = axum::serve(listener, router)
+                .with_graceful_shutdown(async move { ct_for_axum.cancelled().await })
+                .await;
+            if let Err(e) = result {
+                tracing::error!(error = %e, "axum::serve exited with error");
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Stdio transport (default).
+    let stdio_task = if config.server.listen_stdio {
+        let handler = TypeDbMcp::new(config.clone(), typedb.clone(), sessions.clone());
+        let service = handler.serve(stdio()).await.map_err(|e| {
+            tracing::error!("rmcp stdio service failed to start: {:?}", e);
+            anyhow::anyhow!("rmcp stdio service: {e}")
+        })?;
+        Some(tokio::spawn(async move {
+            if let Err(e) = service.waiting().await {
+                tracing::error!(error = %e, "stdio service exited with error");
+            }
+        }))
+    } else {
+        None
+    };
+
+    if http_task.is_none() && stdio_task.is_none() {
+        anyhow::bail!("neither stdio nor HTTP transport is enabled in config");
     }
 
-    if !config.server.listen_stdio {
-        anyhow::bail!("listen_stdio is false and HTTP transport is not yet wired");
+    // Wait for either:
+    //   1. stdio task to end naturally (client disconnected)
+    //   2. Ctrl-C
+    // Either triggers HTTP shutdown via the cancellation token.
+    let stdio_done: futures::future::BoxFuture<'_, ()> = match stdio_task {
+        Some(handle) => Box::pin(async move {
+            let _ = handle.await;
+        }),
+        None => Box::pin(futures::future::pending()),
+    };
+    let ctrl_c: futures::future::BoxFuture<'_, ()> = Box::pin(async {
+        let _ = tokio::signal::ctrl_c().await;
+    });
+
+    tokio::select! {
+        _ = stdio_done => tracing::info!("stdio transport closed; shutting down"),
+        _ = ctrl_c => tracing::info!("received ctrl-c; shutting down"),
     }
-
-    let handler = TypeDbMcp::new(config, typedb.clone(), sessions);
-    let service = handler.serve(stdio()).await.map_err(|e| {
-        tracing::error!("rmcp service error: {:?}", e);
-        anyhow::anyhow!("rmcp service error: {e}")
-    })?;
-
-    service.waiting().await?;
+    shutdown.cancel();
+    if let Some(h) = http_task {
+        let _ = h.await;
+    }
     typedb.force_close();
     Ok(())
 }
