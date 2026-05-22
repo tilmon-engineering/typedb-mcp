@@ -1,0 +1,8 @@
+target
+.git
+.github
+tests
+*.md
+config.local.toml
+config.smoke.toml
+.mcp.json
