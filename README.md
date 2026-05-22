@@ -30,6 +30,121 @@ The MCP-facing surface (nine tools, served over Streamable HTTP at
 `/mcp`) matches upstream's intent. The wire-level behaviour is
 intentionally stricter.
 
+## Theory: agent affordances are user affordances
+
+The design of this server rests on one observation: **the things that make
+a tool easier for a human to use correctly are the same things that make
+it easier for an agent to use correctly**. The two populations have
+different failure modes — humans get bored, agents hallucinate — but they
+fail for a shared underlying reason, which is that *both have to resolve
+indirection to act, and both have a finite budget for doing so*.
+
+### Indirection resolution
+
+Consider two errors:
+
+> Specified database does not exist.
+
+versus
+
+> Specified database `agnts` does not exist. Available databases: `agents`,
+> `ost`, `scratch`.
+
+The first error tells the caller that something is wrong. To recover from
+it, the caller has to do additional work: figure out which database was
+specified, list the databases that *do* exist, compare the two, guess at
+the intended name, and retry. Every one of those steps is a hop of
+indirection — a separate question the caller has to answer before it can
+make progress.
+
+The second error collapses all of those hops into the response itself.
+The caller does not have to ask "what databases exist?" because that
+question is already answered. It does not have to ask "what did I
+specify?" because the verbatim input is quoted. The recovery path is
+one read, not five.
+
+A human reading the first error is mildly inconvenienced. An agent
+reading the first error has to spend tokens on a multi-turn investigation
+that ends, often, in a fabricated database name. The cost differential
+between the two error messages is small for the human and large for the
+agent — but the *direction* of the cost is the same. Better is better
+for both.
+
+### Attention stacking
+
+The same principle applies to nested wrappers:
+
+> An error occurred while handling a request: an error occurred while
+> performing operation Y on object Z: an error occurred in subsystem W:
+> ...
+
+Each `an error occurred while` is a frame the reader has to push onto a
+mental stack before they reach the actual claim. By the time the reader
+hits the leaf, they have to pop frames back up to relate the leaf to the
+original call. For a human this is fatiguing; for an agent it is
+fatiguing *and* lossy, because the model has to hold the stack in working
+context while doing the rest of its reasoning.
+
+The fix is the same in both cases: state the operation and the object
+once, plainly, at the top of the message, and put the leaf cause inline
+rather than wrapping it. A response should read top-down, not
+inside-out.
+
+### Pronouns and un-qualified references
+
+A related failure mode is excessive pronouns and ambiguous referents in
+documentation, prompts, and inter-system messages. "It calls the API and
+then it returns the result, which it then passes to the handler" contains
+three `it`s with three different referents. A human reader can usually
+disambiguate from context with effort. An agent often cannot, and silent
+mis-resolution shows up downstream as confidently wrong code.
+
+The mitigation is mechanical: when writing for a system that involves
+multiple actors and objects, rewrite sentences to use the
+fully-qualified noun every time. The prose gets longer; the indirection
+budget drops to zero. That is the right trade for anything an agent will
+read.
+
+### How those principles show up in this server
+
+- **`next_moves` on every response.** The agent is stateless between
+  tool calls beyond what the response carries. Rather than expect the
+  agent to remember the state machine, every response re-teaches the
+  immediate horizon — the literal tool names that are valid next, given
+  the session's current state. The agent does not have to resolve "what
+  comes after a successful `open_write`?" because the response already
+  answered it.
+
+- **Lifecycle-aware errors.** Every error answers, in the same envelope,
+  the question "is my transaction still alive?" via a structured
+  `retriable_in_same_tx` boolean and a prose sentence. The agent does
+  not have to cross-reference the error class against a table in
+  `DESIGN.md` to decide whether to retry or to open a fresh transaction.
+
+- **Schema-read gate, enforced and explained.** The server refuses to
+  open a transaction on a database whose schema the session has not yet
+  read. That refusal is enforced in code and *also* documented in the
+  tool descriptions the agent sees. The constraint is not a hidden
+  precondition that surfaces as a confusing error; it is a stated rule
+  with a named recovery path.
+
+- **Plain, fully-qualified prose in tool descriptions.** Tool
+  descriptions name the tools they reference (`open_read`, `commit`)
+  with literal backticked names rather than "the read tool" or "the
+  finalization step". This costs a handful of tokens and removes a
+  category of agent mis-resolution entirely.
+
+None of this is novel. It is the same set of techniques a careful
+technical writer would apply to documentation for a human audience. The
+claim of this server is just that those techniques are not optional when
+the reader is an LLM, because the LLM has no way to ask a follow-up
+question on its own behalf — every ambiguity it encounters either gets
+resolved by additional tool calls (expensive) or papered over by
+fabrication (worse).
+
+The shorthand: **build for the agent the way you would build for a
+careful but tired human, and both will do better work**.
+
 ## Running the container
 
 Published to GitHub Container Registry:
