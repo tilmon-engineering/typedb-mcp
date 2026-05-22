@@ -19,7 +19,7 @@ use tracing_subscriber::EnvFilter;
 use typedb_mcp::{
     config::Config,
     handler::TypeDbMcp,
-    session::{SessionStore, run_idle_reaper},
+    session::{SessionStore, run_reaper},
     typedb::TypeDbClient,
 };
 
@@ -51,11 +51,12 @@ async fn main() -> Result<()> {
 
     let sessions = SessionStore::new();
 
-    // Idle reaper
+    // Reaper: rolls back idle transactions and purges expired sessions.
     {
         let s = sessions.clone();
-        let idle = config.idle_timeout();
-        tokio::spawn(async move { run_idle_reaper(s, idle).await });
+        let tx_idle = config.idle_timeout();
+        let session_ttl = config.session_ttl();
+        tokio::spawn(async move { run_reaper(s, tx_idle, session_ttl).await });
     }
 
     let shutdown = CancellationToken::new();

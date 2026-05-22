@@ -1,6 +1,7 @@
 # typedb-mcp
 
-Last verified: 2026-05-22
+Last verified: 2026-05-22 (updated: server-issued sessions are the new
+state-machine root; see DESIGN.md §3 and §7.0)
 
 A safety-focused MCP server, written in Rust, that exposes a TypeDB
 3.11+ database to an LLM agent through a connection-bound transaction
@@ -38,31 +39,43 @@ over anything you remember about TypeDB error handling.
 
 ## Design principle: make the state machine easy to follow
 
-The agent is required to navigate a small state machine (schema-read →
-open → query → commit/rollback). It is also stateless between tool calls
-beyond what we tell it. The reconciliation: **every tool response must
-re-teach the immediate horizon** — what moves are valid right now, given
-this session's state.
+The agent is required to navigate a small state machine
+(`start_session` → schema-read → open → query → commit/rollback). It is
+also stateless between tool calls beyond what we tell it. The
+reconciliation: **every tool response must re-teach the immediate
+horizon** — what moves are valid right now, given this session's state.
 
 Concretely, every response envelope carries a `next_moves` field — a short
 list of one-line usage reminders. Implementations should keep them short,
-concrete, and named (with literal tool names). Examples:
+concrete, and named (with literal tool names). Every tool except
+`start_session` requires a `session_id` argument, and the hints reflect
+that. Examples:
 
+- `start_session` →
+  *"Pass `session_id` to EVERY subsequent tool call. Use the returned
+  `databases` list to pick one and call `get_schema(session_id=...,
+  database=<name>)` before opening a transaction."*
 - `list_databases` →
-  *"Call `get_schema(database=<name>)` for any database before querying it."*
+  *"Call `get_schema(session_id=..., database=<name>)` for any database
+  before querying it."*
 - `get_schema` →
-  *"Open a transaction: `open_read(db)` for reads, `open_write(db)` for
-  mutations, `open_schema(db)` for schema changes. Or `read_once(db, query)`
-  for a one-shot read."*
+  *"Open a transaction: `open_read(session_id=..., database=...)` for
+  reads, `open_write(...)` for mutations, `open_schema(...)` for schema
+  changes. Or `read_once(session_id=..., database=..., query=...)` for a
+  one-shot read."*
 - `open_read` / `open_write` / `open_schema` →
-  *"Submit a query with `query(typeql)`. End with `commit` (write/schema
-  only) or `rollback`."*
+  *"Submit a query with `query(session_id=..., query=...)`. End with
+  `commit(session_id=...)` (write/schema only) or
+  `rollback(session_id=...)`."*
 - `query` (success) →
   *"Continue with more `query` calls, or close with `commit` (write/schema
   only) or `rollback`."*
 - `commit` / `rollback` →
   *"Open another transaction with `open_*`, or call `get_schema` for a
   different database."*
+- Any tool, on `SESSION_UNKNOWN` / `SESSION_EXPIRED` →
+  *"Call `start_session` to mint a fresh `session_id`, then reissue the
+  call you just made with the new ID."*
 
 When state forks (e.g. `query` returned a recoverable error vs. fatal
 error), `next_moves` should differ accordingly. The agent should never
@@ -76,9 +89,10 @@ drift.
 ## Boundaries
 
 - Safe to edit: `src/`, `DESIGN.md`, `CLAUDE.md`, `Cargo.toml`.
-- The nine tools enumerated in `DESIGN.md` §7 are the entire agent-facing
-  surface. Adding a tenth tool is a design change, not an implementation
-  change — update `DESIGN.md` first.
+- The ten tools enumerated in `DESIGN.md` §7 (`start_session` plus the
+  nine TypeDB-facing tools) are the entire agent-facing surface. Adding
+  an eleventh tool is a design change, not an implementation change —
+  update `DESIGN.md` first.
 
 ## Running and testing
 

@@ -1,5 +1,6 @@
 [server]
-idle_timeout_s = 60
+idle_timeout_s = 60         # tx-level: idle reaper rolls back stale open transactions
+session_ttl_s  = 3600       # session-level: SessionStore entry TTL, refreshed on every call
 result_cap     = 500
 listen_stdio   = true
 # listen_http  = "127.0.0.1:8765"     # not yet wired (see DESIGN.md §11)

@@ -16,6 +16,12 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_idle_timeout_s")]
     pub idle_timeout_s: u64,
+    /// How long a server-issued session may sit idle before its
+    /// `SessionStore` entry is purged (and any tx it held rolled back).
+    /// Refreshed on every tool call that resolves the session. Default
+    /// 3600s (60 minutes) per DESIGN.md §3.
+    #[serde(default = "default_session_ttl_s")]
+    pub session_ttl_s: u64,
     #[serde(default = "default_result_cap")]
     pub result_cap: usize,
     #[serde(default = "default_true")]
@@ -66,6 +72,7 @@ pub struct LoggingConfig {
 }
 
 fn default_idle_timeout_s() -> u64 { 60 }
+fn default_session_ttl_s() -> u64 { 3600 }
 fn default_result_cap() -> usize { 500 }
 fn default_true() -> bool { true }
 
@@ -78,6 +85,10 @@ impl Config {
 
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_secs(self.server.idle_timeout_s)
+    }
+
+    pub fn session_ttl(&self) -> Duration {
+        Duration::from_secs(self.server.session_ttl_s)
     }
 
     pub fn typedb_credentials(&self) -> anyhow::Result<(String, String)> {

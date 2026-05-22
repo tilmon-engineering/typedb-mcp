@@ -32,9 +32,11 @@ fn test_config() -> Config {
     Config {
         server: ServerConfig {
             idle_timeout_s: 60,
+            session_ttl_s: 3600,
             result_cap: 500,
             listen_stdio: true,
             listen_http: None,
+            allowed_hosts: None,
         },
         typedb: TypeDbConfig {
             address: "127.0.0.1:1729".into(),
@@ -126,14 +128,39 @@ async fn call(
     client.call_tool(params).await.expect("call_tool transport")
 }
 
+/// Mint a fresh session_id and return it. Tests should call this once at
+/// the top of each scenario, then pass the returned id into every other
+/// tool call's args.
+async fn mint_sid(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, DummyClient>,
+) -> String {
+    let result = call(client, "start_session", serde_json::Value::Null).await;
+    let env = envelope(&result);
+    env["result"]["session_id"]
+        .as_str()
+        .expect("start_session response has result.session_id")
+        .to_owned()
+}
+
+/// Merge a session_id into a JSON object literal (or build one if Null).
+fn with_sid(sid: &str, mut args: serde_json::Value) -> serde_json::Value {
+    if args.is_null() {
+        args = serde_json::json!({});
+    }
+    let map = args.as_object_mut().expect("args is object");
+    map.insert("session_id".into(), serde_json::Value::String(sid.into()));
+    args
+}
+
 // ---------- 1. list_databases returns proper envelope ----------
 
 #[tokio::test]
 async fn mcp_list_databases_envelope() {
     if !enabled() { return; }
     let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
 
-    let result = call(&client, "list_databases", serde_json::Value::Null).await;
+    let result = call(&client, "list_databases", with_sid(&sid, serde_json::Value::Null)).await;
     assert!(!is_error(&result));
     let env = envelope(&result);
     assert!(env.get("session").is_some(), "session block present");
@@ -156,11 +183,12 @@ async fn mcp_list_databases_envelope() {
 async fn mcp_schema_gate_blocks_open_without_get_schema() {
     if !enabled() { return; }
     let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
 
     let result = call(
         &client,
         "open_read",
-        serde_json::json!({"database": "nonexistent_for_gate_test"}),
+        with_sid(&sid, serde_json::json!({"database": "nonexistent_for_gate_test"})),
     )
     .await;
     assert!(is_error(&result), "open without get_schema should be an error");
@@ -183,6 +211,7 @@ async fn mcp_schema_gate_blocks_open_without_get_schema() {
 async fn mcp_full_write_lifecycle() {
     if !enabled() { return; }
     let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
 
     // Set up a fresh database out-of-band so we don't need a `create_database`
     // tool. The MCP server doesn't expose database creation by design.
@@ -208,7 +237,7 @@ async fn mcp_full_write_lifecycle() {
     schema_tx.commit().await.unwrap();
 
     // 1. get_schema — clears the gate
-    let r = call(&client, "get_schema", serde_json::json!({"database": db})).await;
+    let r = call(&client, "get_schema", with_sid(&sid, serde_json::json!({"database": db}))).await;
     assert!(!is_error(&r), "get_schema should succeed");
     let env = envelope(&r);
     assert!(env["result"]["schema"].as_str().unwrap().contains("widget"));
@@ -222,7 +251,7 @@ async fn mcp_full_write_lifecycle() {
     );
 
     // 2. open_write
-    let r = call(&client, "open_write", serde_json::json!({"database": db})).await;
+    let r = call(&client, "open_write", with_sid(&sid, serde_json::json!({"database": db}))).await;
     assert!(!is_error(&r));
     let env = envelope(&r);
     assert_eq!(env["session"]["transaction"]["kind"], "write");
@@ -231,7 +260,7 @@ async fn mcp_full_write_lifecycle() {
     let r = call(
         &client,
         "query",
-        serde_json::json!({"query": "insert $w isa widget, has name \"first\";"}),
+        with_sid(&sid, serde_json::json!({"query": "insert $w isa widget, has name \"first\";"})),
     )
     .await;
     assert!(!is_error(&r), "insert should succeed: {r:?}");
@@ -240,7 +269,7 @@ async fn mcp_full_write_lifecycle() {
     let r = call(
         &client,
         "query",
-        serde_json::json!({"query": "match $w isa widget, has name $n; fetch { \"name\": $n };"}),
+        with_sid(&sid, serde_json::json!({"query": "match $w isa widget, has name $n; fetch { \"name\": $n };"})),
     )
     .await;
     assert!(!is_error(&r));
@@ -250,7 +279,7 @@ async fn mcp_full_write_lifecycle() {
     assert_eq!(answers[0]["name"], "first");
 
     // 5. commit
-    let r = call(&client, "commit", serde_json::Value::Null).await;
+    let r = call(&client, "commit", with_sid(&sid, serde_json::Value::Null)).await;
     assert!(!is_error(&r), "commit should succeed: {r:?}");
     let env = envelope(&r);
     assert_eq!(env["result"]["committed"], true);
@@ -260,7 +289,7 @@ async fn mcp_full_write_lifecycle() {
     let r = call(
         &client,
         "read_once",
-        serde_json::json!({"database": db, "query": "match $w isa widget, has name $n; fetch { \"name\": $n };"}),
+        with_sid(&sid, serde_json::json!({"database": db, "query": "match $w isa widget, has name $n; fetch { \"name\": $n };"})),
     )
     .await;
     assert!(!is_error(&r), "read_once should succeed: {r:?}");
@@ -282,6 +311,7 @@ async fn mcp_full_write_lifecycle() {
 async fn mcp_second_open_returns_tx_already_open() {
     if !enabled() { return; }
     let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
 
     let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
         .await
@@ -298,8 +328,8 @@ async fn mcp_second_open_returns_tx_already_open() {
         .unwrap();
     schema_tx.commit().await.unwrap();
 
-    let _ = call(&client, "get_schema", serde_json::json!({"database": db})).await;
-    let r = call(&client, "open_write", serde_json::json!({"database": db})).await;
+    let _ = call(&client, "get_schema", with_sid(&sid, serde_json::json!({"database": db}))).await;
+    let r = call(&client, "open_write", with_sid(&sid, serde_json::json!({"database": db}))).await;
     assert!(!is_error(&r), "first open_write succeeds");
     let first_tx_id = envelope(&r)["session"]["transaction"]["id"]
         .as_str()
@@ -307,7 +337,7 @@ async fn mcp_second_open_returns_tx_already_open() {
         .to_owned();
 
     // Now try to open a schema tx without committing or rolling back.
-    let r = call(&client, "open_schema", serde_json::json!({"database": db})).await;
+    let r = call(&client, "open_schema", with_sid(&sid, serde_json::json!({"database": db}))).await;
     assert!(is_error(&r), "second open_* must be an error, not silent replacement");
     let env = envelope(&r);
     assert_eq!(env["error"]["class"], "TX_ALREADY_OPEN");
@@ -318,7 +348,7 @@ async fn mcp_second_open_returns_tx_already_open() {
     assert_eq!(env["session"]["transaction"]["id"], first_tx_id);
     assert_eq!(env["session"]["transaction"]["kind"], "write");
 
-    let _ = call(&client, "rollback", serde_json::Value::Null).await;
+    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
     setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;
@@ -330,6 +360,7 @@ async fn mcp_second_open_returns_tx_already_open() {
 async fn mcp_parse_error_keeps_tx_open() {
     if !enabled() { return; }
     let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
 
     let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
         .await
@@ -347,12 +378,12 @@ async fn mcp_parse_error_keeps_tx_open() {
     schema_tx.commit().await.unwrap();
 
     // Walk through MCP to open a write tx
-    let _ = call(&client, "get_schema", serde_json::json!({"database": db})).await;
-    let r = call(&client, "open_write", serde_json::json!({"database": db})).await;
+    let _ = call(&client, "get_schema", with_sid(&sid, serde_json::json!({"database": db}))).await;
+    let r = call(&client, "open_write", with_sid(&sid, serde_json::json!({"database": db}))).await;
     assert!(!is_error(&r));
 
     // Bad query
-    let r = call(&client, "query", serde_json::json!({"query": "not valid typeql"})).await;
+    let r = call(&client, "query", with_sid(&sid, serde_json::json!({"query": "not valid typeql"}))).await;
     assert!(is_error(&r), "syntax error should be an error result");
     let env = envelope(&r);
     assert_eq!(env["error"]["class"], "PARSE_ERROR");
@@ -369,11 +400,11 @@ async fn mcp_parse_error_keeps_tx_open() {
     let r = call(
         &client,
         "query",
-        serde_json::json!({"query": "insert $w isa widget, has name \"recovered\";"}),
+        with_sid(&sid, serde_json::json!({"query": "insert $w isa widget, has name \"recovered\";"})),
     )
     .await;
     assert!(!is_error(&r), "post-parse-error insert should succeed");
-    let _ = call(&client, "rollback", serde_json::Value::Null).await;
+    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
 
     setup.delete_database(&db).await.unwrap();
     drop(client);

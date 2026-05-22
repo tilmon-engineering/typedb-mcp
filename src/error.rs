@@ -11,6 +11,16 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorClass {
+    /// A tool other than `start_session` was called with a `session_id`
+    /// the server does not recognize. Means the agent either fabricated
+    /// an ID, used one from a different process lifetime, or hit a
+    /// `SessionExpired` and dropped that signal. Recovery: call
+    /// `start_session` for a fresh ID.
+    SessionUnknown,
+    /// A tool was called with a known `session_id` whose TTL has passed.
+    /// The session has been purged (along with any tx it held). Recovery:
+    /// call `start_session` for a fresh ID.
+    SessionExpired,
     /// `open_*` / `read_once` called before `get_schema` for the database.
     SchemaNotRead,
     /// A second `open_*` issued while a transaction is already open.
@@ -81,6 +91,8 @@ impl ErrorClass {
                 | TxIsRead
                 | TxAlreadyOpen
         )
+        // SessionUnknown/SessionExpired deliberately false: there IS no
+        // session, so by definition no tx is alive.
     }
 }
 

@@ -69,12 +69,39 @@ agent-facing state machine.
 
 ## 3. Session state
 
-Per MCP session, the server holds:
+### Why sessions are explicit, not transport-derived
+
+The server's safety thesis depends on cross-call state (schema-read gate,
+single-tx invariant, transactional lifecycle). MCP's Streamable HTTP
+transport defines a session via the `Mcp-Session-Id` header, but in
+practice some prominent clients (notably LiteLLM's MCP gateway, observed
+on edge-01 2026-05-22) treat each tool call as a fresh `initialize` →
+call → `DELETE /mcp` cycle. Under that pattern the transport session
+exists for only one tool call and our cross-call state is never
+reachable. The schema gate fires on every `open_*` because the prior
+`get_schema` happened in a transport-session that has already been torn
+down.
+
+We therefore decouple from the transport. The server issues its **own**
+session identifier via the `start_session` tool, and **every other tool
+requires the agent to pass that identifier in as a `session_id`
+parameter**. Whether the transport session survives between calls is
+irrelevant: the `session_id` argument is what reconstitutes our state.
+
+This is a load-bearing design choice. It changes the agent's first move
+on entry from "call `list_databases` or `get_schema`" to "call
+`start_session`."
+
+### Per-session data
+
+Per server session, the server holds:
 
 ```
 SessionState {
-  schema_seen: HashMap<DatabaseName, ()>,   // databases whose schema was read this session
-  tx: Option<OpenTx>,
+  id: SessionId,                            // UUID v4, returned by start_session
+  schema_seen: HashSet<DatabaseName>,       // databases whose schema was read this session
+  tx: Option<OpenTx>,                       // at most one open tx per session
+  expires_at: Instant,                      // absolute deadline; refreshed on each tool call
 }
 
 OpenTx {
@@ -86,21 +113,43 @@ OpenTx {
 }
 ```
 
-State invariants:
+### State invariants
 
-1. **At most one transaction per session.** Attempting to open a second one
-   while one is already open returns `TX_ALREADY_OPEN`.
-2. **Schema must be read before opening a transaction.** Each
-   `open_read | open_write | open_schema` checks `schema_seen` for the target
-   database. `read_once` enforces the same gate.
-3. **`schema_seen` is cleared for `db` whenever a `schema` transaction
-   committed against `db` succeeds.** The agent's mental model of the schema
-   is now stale by its own action; force a re-read before any further work.
-4. **Idle reaper.** A background task scans sessions and rolls back any
-   transaction whose `last_activity` is older than `idle_timeout_s` (default
-   60s, configurable). The session keeps existing — only the transaction is
-   reaped. The agent learns about the reaping by getting an error on its
-   next call (no push notifications; see §2).
+1. **Sessions are minted only by `start_session`.** No tool other than
+   `start_session` ever creates or accepts an unknown `session_id`.
+   Calling any other tool with a `session_id` the server does not know
+   returns `SESSION_UNKNOWN`. The agent's recovery is to call
+   `start_session` (which yields a fresh ID) and reissue.
+2. **Sessions expire on inactivity.** `expires_at` is initialized to
+   `now + session_ttl_s` (default 3600s) at `start_session`, and refreshed
+   to `now + session_ttl_s` on every subsequent tool call that
+   successfully resolves the session. A tool call whose `session_id`
+   resolves to an *expired* session returns `SESSION_EXPIRED` and the
+   stored session is purged. The agent must call `start_session` to get
+   a new one.
+3. **Transport teardown does not touch session state.** A DELETE on the
+   MCP transport session (or a stdio disconnect) does not destroy any
+   `SessionState` — only the TTL reaper does. The transport and
+   application session lifecycles are deliberately independent.
+4. **At most one transaction per session.** Attempting to open a second
+   one while one is already open returns `TX_ALREADY_OPEN`.
+5. **Schema must be read before opening a transaction.** Each
+   `open_read | open_write | open_schema` checks `schema_seen` for the
+   target database. `read_once` enforces the same gate.
+6. **`schema_seen` is cleared for `db` whenever a `schema` transaction
+   committed against `db` succeeds.** The agent's mental model of the
+   schema is now stale by its own action; force a re-read before any
+   further work.
+7. **Idle reaper for open transactions.** A background task scans
+   sessions and rolls back any transaction whose `last_activity` is older
+   than `tx_idle_timeout_s` (default 60s, configurable, distinct from
+   `session_ttl_s`). The session keeps existing — only the transaction
+   is reaped. The agent learns about the reaping by getting an error on
+   its next call (no push notifications; see §2).
+8. **Session reaper for whole sessions.** The same background task purges
+   `SessionState` whose `expires_at` is in the past. If such a session
+   held an open tx, that tx is rolled back as part of the purge — a
+   session purge is the strongest form of cleanup.
 
 ---
 
@@ -154,6 +203,8 @@ TypeDB 3.x's error behaviour was probed against
 | Write-execution (regex, @values, etc.)   | `... -> WEX1 -> PEX6 -> QEX14 -> TSV11 -> HSR16`              | **NO**       |
 | Commit-time (cardinality, deferred)      | `... -> COW5 -> DCT3 -> TSV5 -> HSR18`                        | **NO**       |
 | Operation on already-dead tx             | `TSV12 "no open transaction" -> HSR16`                        | n/a          |
+| Server-issued `session_id` not recognized | (server-internal: SessionStore lookup miss)                  | n/a          |
+| Server-issued `session_id` past TTL       | (server-internal: SessionStore lookup miss after purge)      | n/a          |
 
 The discriminator between **recoverable** and **fatal** is the presence of the
 `WEX1 / PEX6 / QEX14` chain (write pipeline) in the TypeDB error stack, or any
@@ -317,23 +368,54 @@ Notes:
 
 ## 7. Tool surface
 
-Nine tools.
+Ten tools. The first, `start_session`, mints the `session_id` that every
+other tool requires (see §3). All non-`start_session` tools take
+`session_id: string` as a required argument and return `SESSION_UNKNOWN`
+or `SESSION_EXPIRED` if it does not resolve.
+
+### 7.0 `start_session`
+
+- **Params**: none
+- **Returns**: `{ session_id: string, expires_in_seconds: integer,
+  databases: [{name}, ...] }`. `expires_in_seconds` is the configured
+  TTL (per-call resolution refreshes it); reporting it relative rather
+  than as an absolute timestamp avoids any clock-skew confusion at the
+  agent. The database list is returned for
+  convenience — it is the same content `list_databases` returns and makes
+  the post-session-start tool selection one call shorter for the common
+  case.
+- **Annotation**: read-only, **state-creating**
+- **Gate**: none
+- **Errors**: `UPSTREAM_UNAVAILABLE` (cannot fetch the database list;
+  `session_id` is still issued in that case so the agent can retry the
+  database fetch via `list_databases` without re-minting)
+- **`next_moves`**: same response-envelope contract as every other tool;
+  carries one-line reminders that the agent must pass `session_id` to
+  every subsequent call, and that calling `get_schema(database)` for any
+  database is the required next step before opening a transaction on it.
+- **Description (agent-facing)**: "Mint a new server-side session and
+  return its `session_id`. Pass the `session_id` to every other tool.
+  Sessions expire after a configured period of inactivity (default 60
+  minutes); on `SESSION_EXPIRED` or `SESSION_UNKNOWN`, call this again
+  for a fresh ID."
 
 ### 7.1 `list_databases`
 
-- **Params**: none
+- **Params**: `session_id: string`
 - **Returns**: `{ databases: [{name}, ...] }`
 - **Annotation**: read-only, idempotent
-- **Gate**: none
-- **Errors**: `UPSTREAM_UNAVAILABLE`
+- **Gate**: valid session
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `UPSTREAM_UNAVAILABLE`
 
 ### 7.2 `get_schema`
 
-- **Params**: `database: string`
+- **Params**: `session_id: string`, `database: string`
 - **Returns**: `{ schema: "<full TypeQL define text>" }`
 - **Annotation**: read-only, idempotent
-- **Gate**: none. **Sets** `schema_seen[database]`.
-- **Errors**: `UNKNOWN_DATABASE`, `UPSTREAM_UNAVAILABLE`
+- **Gate**: valid session. **Sets** `schema_seen[database]` on that
+  session.
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `UNKNOWN_DATABASE`,
+  `UPSTREAM_UNAVAILABLE`
 - **Description (agent-facing)**: "Returns the full TypeQL `define` source for
   a database. You **must** call this before opening any transaction on the
   database. TypeQL 3.x differs materially from 2.x; do not write queries from
@@ -341,16 +423,16 @@ Nine tools.
 
 ### 7.3 `open_read`
 
-- **Params**: `database: string`
+- **Params**: `session_id: string`, `database: string`
 - **Returns**: session block with new tx
 - **Annotation**: read-only
-- **Gate**: `tx is None AND schema_seen[database]`
-- **Errors**: `SCHEMA_NOT_READ`, `TX_ALREADY_OPEN`, `UNKNOWN_DATABASE`,
-  `UPSTREAM_UNAVAILABLE`
+- **Gate**: valid session AND `tx is None AND schema_seen[database]`
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `SCHEMA_NOT_READ`,
+  `TX_ALREADY_OPEN`, `UNKNOWN_DATABASE`, `UPSTREAM_UNAVAILABLE`
 
 ### 7.4 `open_write`
 
-- **Params**: `database: string`
+- **Params**: `session_id: string`, `database: string`
 - **Returns**: session block with new tx
 - **Annotation**: **destructive on commit** (mutations only land on commit)
 - **Gate**: same as `open_read`
@@ -358,7 +440,7 @@ Nine tools.
 
 ### 7.5 `open_schema`
 
-- **Params**: `database: string`
+- **Params**: `session_id: string`, `database: string`
 - **Returns**: session block with new tx
 - **Annotation**: **destructive, schema-level** — clients should escalate
   confirmation
@@ -367,13 +449,14 @@ Nine tools.
 
 ### 7.6 `query`
 
-- **Params**: `query: string` (TypeQL)
+- **Params**: `session_id: string`, `query: string` (TypeQL)
 - **Returns**: `{ answer_type, answers, warning }` + session block
 - **Annotation**: behaviour depends on the open transaction's kind. Tool
   description must say so explicitly.
-- **Gate**: tx is `Open`
-- **Errors**: `NO_TX_OPEN`, `WRONG_TX_TYPE`, `PARSE_ERROR`, `TYPE_ERROR`,
-  `WRITE_FAILED`, `RESULT_LIMIT_EXCEEDED`, `TIMEOUT`,
+- **Gate**: valid session AND tx is `Open`
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `NO_TX_OPEN`,
+  `WRONG_TX_TYPE`, `PARSE_ERROR`, `TYPE_ERROR`, `WRITE_FAILED`,
+  `RESULT_LIMIT_EXCEEDED`, `TIMEOUT`,
   `IDLE_TIMEOUT` (if tx was reaped between calls)
 - **Result cap**: if the server-side cap (default 500, configurable) is
   reached, the answers are **discarded** and `RESULT_LIMIT_EXCEEDED` is
@@ -381,35 +464,39 @@ Nine tools.
 
 ### 7.7 `commit`
 
-- **Params**: none
+- **Params**: `session_id: string`
 - **Returns**: session block with `tx: null`
 - **Annotation**: finalize
-- **Gate**: tx is `Open` and `kind != Read`
-- **Errors**: `NO_TX_OPEN`, `TX_IS_READ`, `COMMIT_FAILED`,
-  `UPSTREAM_UNAVAILABLE`
+- **Gate**: valid session AND tx is `Open` and `kind != Read`
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `NO_TX_OPEN`,
+  `TX_IS_READ`, `COMMIT_FAILED`, `UPSTREAM_UNAVAILABLE`
 - **Side effect**: if the tx was a `schema` tx, `schema_seen[database]` is
   cleared on successful commit.
 
 ### 7.8 `rollback`
 
-- **Params**: none
+- **Params**: `session_id: string`
 - **Returns**: session block with `tx: null`
 - **Annotation**: cleanup
-- **Gate**: none — forgiving
-- **Behaviour**: if no tx is open, returns success with a short ack
-  ("No transaction was open; nothing to roll back."). The safe direction.
+- **Gate**: valid session — otherwise forgiving
+- **Behaviour**: if the session is valid and no tx is open, returns
+  success with a short ack ("No transaction was open; nothing to roll
+  back."). The safe direction. `SESSION_UNKNOWN`/`SESSION_EXPIRED` still
+  error, since there is no session in which to "do nothing."
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`
 
 ### 7.9 `read_once`
 
-- **Params**: `database: string`, `query: string`
+- **Params**: `session_id: string`, `database: string`, `query: string`
 - **Returns**: `{ answer_type, answers, warning }` + session block (tx still
   null afterward)
 - **Annotation**: read-only, idempotent
-- **Gate**: `tx is None AND schema_seen[database]`
+- **Gate**: valid session AND `tx is None AND schema_seen[database]`
 - **Behaviour**: internally `open_read -> query -> close`. The transaction is
   not exposed to the agent.
-- **Errors**: `SCHEMA_NOT_READ`, `TX_ALREADY_OPEN` (if a tx is already open in
-  this session), `PARSE_ERROR`, `TYPE_ERROR`, `UNKNOWN_DATABASE`,
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `SCHEMA_NOT_READ`,
+  `TX_ALREADY_OPEN` (if a tx is already open in this session),
+  `PARSE_ERROR`, `TYPE_ERROR`, `UNKNOWN_DATABASE`,
   `RESULT_LIMIT_EXCEEDED`, `TIMEOUT`, `UPSTREAM_UNAVAILABLE`
 - **Why no `write_once`**: deliberate. The safety thesis of this server is
   that the agent must look at the data before committing a write. A one-shot
@@ -449,10 +536,11 @@ returns rows 4-6.
 
 ```toml
 [server]
-idle_timeout_s = 60
-result_cap     = 500
-listen_stdio   = true
-listen_http    = "127.0.0.1:8765"     # null to disable
+idle_timeout_s   = 60     # tx-level: how long an open tx may sit idle before reap
+session_ttl_s    = 3600   # session-level: TTL on the SessionStore entry, refreshed on every call
+result_cap       = 500
+listen_stdio     = true
+listen_http      = "127.0.0.1:8765"     # null to disable
 
 [typedb]
 address     = "127.0.0.1:1729"                  # gRPC host:port; no scheme
