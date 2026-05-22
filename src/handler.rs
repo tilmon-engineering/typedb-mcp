@@ -1,0 +1,871 @@
+//! MCP tool handlers. See DESIGN.md §7.
+//!
+//! Per-session state is held behind a `tokio::sync::Mutex` so the live
+//! driver `Transaction` can be borrowed across `await` points safely. The
+//! agent issues one tool call at a time per session, so per-session
+//! contention is theoretical.
+//!
+//! Agent-facing errors (e.g. `PARSE_ERROR`) are returned as `CallToolResult`
+//! with `is_error: true` carrying the structured envelope — NOT as
+//! protocol-level `McpError`. Protocol errors are reserved for things the
+//! agent cannot reason about (transport breakage, malformed JSON requests).
+
+use std::{sync::Arc, time::Instant};
+
+use rmcp::{
+    ErrorData as McpError, RoleServer, ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
+    schemars,
+    service::RequestContext,
+    tool, tool_handler, tool_router,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    config::Config,
+    error::{ErrorClass, InternalError},
+    session::{OpenTx, SessionId, SessionSnapshot, SessionStore},
+    typedb::{TxKind, TypeDbClient, query_answer_to_json},
+};
+
+#[derive(Clone)]
+pub struct TypeDbMcp {
+    pub config: Arc<Config>,
+    pub typedb: Arc<TypeDbClient>,
+    pub sessions: Arc<SessionStore>,
+    pub tool_router: ToolRouter<TypeDbMcp>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DatabaseParam {
+    /// Name of the TypeDB database.
+    pub database: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QueryParam {
+    /// TypeQL 3.x query. The transaction kind required is determined by the
+    /// currently-open transaction in this session.
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadOnceParam {
+    pub database: String,
+    pub query: String,
+}
+
+#[tool_router]
+impl TypeDbMcp {
+    pub fn new(
+        config: Arc<Config>,
+        typedb: Arc<TypeDbClient>,
+        sessions: Arc<SessionStore>,
+    ) -> Self {
+        Self {
+            config,
+            typedb,
+            sessions,
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    #[tool(description = "\
+List all databases available on the TypeDB server. Read-only; safe to call \
+without restriction.")]
+    async fn list_databases(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = session_id_from(&ctx);
+        let snap = self.sessions.snapshot(&sid).await;
+        match self.typedb.list_databases().await {
+            Ok(names) => {
+                let result = serde_json::json!({
+                    "databases": names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>()
+                });
+                Ok(envelope_ok(snap, result, next_moves::after_list_databases()))
+            }
+            Err(e) => Ok(envelope_err(
+                snap,
+                e,
+                "Could not list databases.",
+                next_moves::on_upstream_unavailable(),
+            )),
+        }
+    }
+
+    #[tool(description = "\
+Return the complete TypeQL `define` source for a database. You MUST call \
+this before opening any transaction on the database; the safety layer blocks \
+`open_read`, `open_write`, `open_schema`, and `read_once` until you do. \
+TypeQL 3.x differs materially from 2.x — do not write queries from prior \
+assumptions; treat this schema as ground truth.")]
+    async fn get_schema(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<DatabaseParam>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = session_id_from(&ctx);
+        match self.typedb.get_schema(&p.database).await {
+            Ok(schema) => {
+                let arc = self.sessions.get_or_create(&sid).await;
+                {
+                    let mut state = arc.lock().await;
+                    state.schema_seen.insert(p.database.clone());
+                }
+                let snap = self.sessions.snapshot(&sid).await;
+                Ok(envelope_ok(
+                    snap,
+                    serde_json::json!({
+                        "database": p.database,
+                        "schema": schema,
+                    }),
+                    next_moves::after_get_schema(&p.database),
+                ))
+            }
+            Err(e) => {
+                let class = e.to_class();
+                let snap = self.sessions.snapshot(&sid).await;
+                Ok(envelope_err(
+                    snap,
+                    e,
+                    "Could not fetch schema.",
+                    next_moves::on_error(class, Some(&p.database)),
+                ))
+            }
+        }
+    }
+
+    #[tool(description = "\
+Open a READ transaction on the named database. Read-only; commits are not \
+permitted (use `rollback` to close, or just leave it for the idle reaper). \
+Requires that `get_schema(database)` was called earlier in this session.")]
+    async fn open_read(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<DatabaseParam>,
+    ) -> Result<CallToolResult, McpError> {
+        self.open_any(ctx, p.database, TxKind::Read).await
+    }
+
+    #[tool(description = "\
+Open a WRITE transaction on the named database. Writes only persist on \
+`commit`; use `rollback` to discard. Requires prior `get_schema(database)`. \
+Constraint violations that reach TypeDB's write pipeline ABORT the \
+transaction — you must then open a new one to continue.")]
+    async fn open_write(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<DatabaseParam>,
+    ) -> Result<CallToolResult, McpError> {
+        self.open_any(ctx, p.database, TxKind::Write).await
+    }
+
+    #[tool(description = "\
+Open a SCHEMA transaction on the named database. SCHEMA changes are \
+DESTRUCTIVE and only persist on `commit`. Requires prior \
+`get_schema(database)`. On successful commit of a schema transaction, the \
+schema-read gate is reset for this database — you must call `get_schema` \
+again before opening further transactions.")]
+    async fn open_schema(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<DatabaseParam>,
+    ) -> Result<CallToolResult, McpError> {
+        self.open_any(ctx, p.database, TxKind::Schema).await
+    }
+
+    #[tool(description = "\
+Execute a TypeQL query against the currently-open transaction. The required \
+transaction kind is determined by the open transaction (set at `open_*` \
+time). Parse, type, and wrong-tx-type errors leave the transaction OPEN — \
+fix the query and retry. Write-pipeline errors close the transaction; you \
+must open a new one. Results are capped (see config); paginate with \
+`sort $k; offset N; limit M;` — `offset` MUST come before `limit`.")]
+    async fn query(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<QueryParam>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = session_id_from(&ctx);
+        let arc = self.sessions.get_or_create(&sid).await;
+        let mut state = arc.lock().await;
+
+        let Some(tx) = state.tx.as_mut() else {
+            drop(state);
+            let snap = self.sessions.snapshot(&sid).await;
+            return Ok(envelope_state_error(
+                snap,
+                ErrorClass::NoTxOpen,
+                "No transaction is open in this session. Use `open_read` for queries, \
+                 `open_write` for mutations, `open_schema` for schema changes, or \
+                 `read_once` for a one-shot read.",
+                next_moves::on_error(ErrorClass::NoTxOpen, None),
+            ));
+        };
+        let kind = tx.kind;
+        tx.last_activity = Instant::now();
+
+        let answer_result = tx.transaction.query(&p.query).await;
+        let result_cap = self.config.server.result_cap;
+
+        match answer_result {
+            Ok(answer) => {
+                match query_answer_to_json(answer, result_cap).await {
+                    Ok(json) => {
+                        let truncated = json.truncated;
+                        let value = json.into_value();
+                        // If we hit the cap, drop the value and surface the
+                        // RESULT_LIMIT_EXCEEDED error — but the tx is still
+                        // alive (the agent can paginate).
+                        if truncated {
+                            drop(state);
+                            let snap = self.sessions.snapshot(&sid).await;
+                            return Ok(envelope_state_error(
+                                snap,
+                                ErrorClass::ResultLimitExceeded,
+                                &format!(
+                                    "Query returned more than {result_cap} answers (server cap). \
+                                     The result has been discarded — TypeDB does not paginate \
+                                     after the fact. Re-issue with `sort $k; offset N; limit M;` \
+                                     (`offset` MUST come before `limit`)."
+                                ),
+                                next_moves::on_error(ErrorClass::ResultLimitExceeded, None),
+                            ));
+                        }
+                        drop(state);
+                        let snap = self.sessions.snapshot(&sid).await;
+                        Ok(envelope_ok(snap, value, next_moves::after_query_ok(kind)))
+                    }
+                    Err(e) => {
+                        // Stream error mid-results: treat as a driver error,
+                        // classify, drop tx if fatal.
+                        let class = e.to_class();
+                        if !class.retriable_in_same_tx() {
+                            state.tx = None;
+                        }
+                        drop(state);
+                        let snap = self.sessions.snapshot(&sid).await;
+                        let moves = next_moves::on_error(class, None);
+                        Ok(envelope_err(snap, e, &explain_query_error(class), moves))
+                    }
+                }
+            }
+            Err(e) => {
+                let internal = InternalError::Driver(e);
+                let class = internal.to_class();
+                if !class.retriable_in_same_tx() {
+                    state.tx = None;
+                }
+                drop(state);
+                let snap = self.sessions.snapshot(&sid).await;
+                let moves = next_moves::on_error(class, None);
+                Ok(envelope_err(snap, internal, &explain_query_error(class), moves))
+            }
+        }
+    }
+
+    #[tool(description = "\
+Commit the currently-open transaction. Only valid for WRITE and SCHEMA \
+transactions (READ transactions cannot be committed; use `rollback`). On \
+successful commit of a SCHEMA transaction, the schema-read gate is reset \
+for the affected database.")]
+    async fn commit(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = session_id_from(&ctx);
+        let arc = self.sessions.get_or_create(&sid).await;
+        let mut state = arc.lock().await;
+
+        let Some(tx) = state.tx.as_ref() else {
+            drop(state);
+            let snap = self.sessions.snapshot(&sid).await;
+            return Ok(envelope_state_error(
+                snap,
+                ErrorClass::NoTxOpen,
+                "No transaction is open in this session. There is nothing to commit.",
+                next_moves::on_error(ErrorClass::NoTxOpen, None),
+            ));
+        };
+
+        if matches!(tx.kind, TxKind::Read) {
+            drop(state);
+            let snap = self.sessions.snapshot(&sid).await;
+            return Ok(envelope_state_error(
+                snap,
+                ErrorClass::TxIsRead,
+                "READ transactions cannot be committed (TypeDB will reject this — \
+                 TSV2). Use `rollback` to close the transaction.",
+                next_moves::on_error(ErrorClass::TxIsRead, None),
+            ));
+        }
+
+        // Take ownership so we can consume `transaction.commit(self)`.
+        let owned = state.tx.take().expect("checked just above");
+        let database = owned.database.clone();
+        let kind = owned.kind;
+        let commit_result = owned.transaction.commit().await;
+
+        match commit_result {
+            Ok(()) => {
+                if matches!(kind, TxKind::Schema) {
+                    state.schema_seen.remove(&database);
+                }
+                drop(state);
+                let snap = self.sessions.snapshot(&sid).await;
+                Ok(envelope_ok(
+                    snap,
+                    serde_json::json!({"committed": true}),
+                    next_moves::after_commit_ok(kind, &database),
+                ))
+            }
+            Err(e) => {
+                let internal = InternalError::Driver(e);
+                let class = internal.to_class();
+                drop(state);
+                let snap = self.sessions.snapshot(&sid).await;
+                Ok(envelope_err(
+                    snap,
+                    internal,
+                    "Commit failed. No changes were persisted; the transaction has been closed.",
+                    next_moves::on_error(class, Some(&database)),
+                ))
+            }
+        }
+    }
+
+    #[tool(description = "\
+Roll back (discard) the currently-open transaction. Forgiving: if no \
+transaction is open, this is a no-op success.")]
+    async fn rollback(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = session_id_from(&ctx);
+        let arc = self.sessions.get_or_create(&sid).await;
+        let mut state = arc.lock().await;
+
+        let Some(tx) = state.tx.take() else {
+            drop(state);
+            let snap = self.sessions.snapshot(&sid).await;
+            return Ok(envelope_ok(
+                snap,
+                serde_json::json!({
+                    "rolled_back": false,
+                    "message": "No transaction was open; nothing to roll back."
+                }),
+                next_moves::after_rollback_ok(),
+            ));
+        };
+
+        // Best-effort: even if rollback errors at the driver, the tx is gone
+        // from our side.
+        if let Err(e) = tx.transaction.rollback().await {
+            tracing::warn!(error = %e, "driver rollback returned an error");
+        }
+        drop(state);
+        let snap = self.sessions.snapshot(&sid).await;
+        Ok(envelope_ok(
+            snap,
+            serde_json::json!({"rolled_back": true}),
+            next_moves::after_rollback_ok(),
+        ))
+    }
+
+    #[tool(description = "\
+Run a single read query against the named database in a managed \
+read-and-close transaction. Convenience for one-shot reads — the transaction \
+is opened, the query is run, and the transaction is closed atomically. \
+Requires prior `get_schema(database)`. Result is capped (see config); \
+paginate with `sort $k; offset N; limit M;`.")]
+    async fn read_once(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<ReadOnceParam>,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = session_id_from(&ctx);
+        let arc = self.sessions.get_or_create(&sid).await;
+        let state = arc.lock().await;
+
+        if state.tx.is_some() {
+            drop(state);
+            let snap = self.sessions.snapshot(&sid).await;
+            return Ok(envelope_state_error(
+                snap,
+                ErrorClass::TxAlreadyOpen,
+                "A transaction is already open in this session. `read_once` cannot \
+                 be used while another transaction is open. Commit or rollback first.",
+                next_moves::on_error(ErrorClass::TxAlreadyOpen, None),
+            ));
+        }
+        if !state.schema_seen.contains(&p.database) {
+            drop(state);
+            let snap = self.sessions.snapshot(&sid).await;
+            return Ok(envelope_state_error(
+                snap,
+                ErrorClass::SchemaNotRead,
+                "Cannot read this database: schema has not been read this session. \
+                 Call `get_schema(database)` first.",
+                next_moves::on_error(ErrorClass::SchemaNotRead, Some(&p.database)),
+            ));
+        }
+        // Drop the guard before doing async work that doesn't need it; the
+        // tx_already_open check above means we won't race against ourselves.
+        drop(state);
+
+        let tx = match self.typedb.open_transaction(&p.database, TxKind::Read).await {
+            Ok(t) => t,
+            Err(e) => {
+                let class = e.to_class();
+                let snap = self.sessions.snapshot(&sid).await;
+                return Ok(envelope_err(
+                    snap,
+                    e,
+                    "Could not open read transaction.",
+                    next_moves::on_error(class, Some(&p.database)),
+                ));
+            }
+        };
+
+        let result_cap = self.config.server.result_cap;
+        let answer_result = tx.query(&p.query).await;
+        // Always rollback the one-shot tx; we never want it left open.
+        let _ = tx.rollback().await;
+
+        let snap = self.sessions.snapshot(&sid).await;
+        match answer_result {
+            Ok(answer) => match query_answer_to_json(answer, result_cap).await {
+                Ok(json) => {
+                    if json.truncated {
+                        Ok(envelope_state_error(
+                            snap,
+                            ErrorClass::ResultLimitExceeded,
+                            &format!(
+                                "Query returned more than {result_cap} answers (server cap). \
+                                 Re-issue via `read_once` (or an explicit `open_read`) with \
+                                 `sort $k; offset N; limit M;` (`offset` MUST come before `limit`)."
+                            ),
+                            next_moves::on_error(ErrorClass::ResultLimitExceeded, None),
+                        ))
+                    } else {
+                        Ok(envelope_ok(snap, json.into_value(), next_moves::after_read_once_ok()))
+                    }
+                }
+                Err(e) => {
+                    let class = e.to_class();
+                    let moves = next_moves::on_error(class, Some(&p.database));
+                    Ok(envelope_err(snap, e, &explain_query_error(class), moves))
+                }
+            },
+            Err(e) => {
+                let internal = InternalError::Driver(e);
+                let class = internal.to_class();
+                let moves = next_moves::on_error(class, Some(&p.database));
+                Ok(envelope_err(snap, internal, &explain_query_error(class), moves))
+            }
+        }
+    }
+
+    async fn open_any(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        database: String,
+        kind: TxKind,
+    ) -> Result<CallToolResult, McpError> {
+        let sid = session_id_from(&ctx);
+        let arc = self.sessions.get_or_create(&sid).await;
+        {
+            let state = arc.lock().await;
+            if state.tx.is_some() {
+                drop(state);
+                let snap = self.sessions.snapshot(&sid).await;
+                return Ok(envelope_state_error(
+                    snap,
+                    ErrorClass::TxAlreadyOpen,
+                    "A transaction is already open in this session. Commit or rollback \
+                     it before opening another.",
+                    next_moves::on_error(ErrorClass::TxAlreadyOpen, None),
+                ));
+            }
+            if !state.schema_seen.contains(&database) {
+                drop(state);
+                let snap = self.sessions.snapshot(&sid).await;
+                return Ok(envelope_state_error(
+                    snap,
+                    ErrorClass::SchemaNotRead,
+                    "Cannot open a transaction on this database: schema has not been \
+                     read this session. Call `get_schema(database)` first.",
+                    next_moves::on_error(ErrorClass::SchemaNotRead, Some(&database)),
+                ));
+            }
+            // Drop the read-side check; reacquire below for the write.
+        }
+
+        let transaction = match self.typedb.open_transaction(&database, kind).await {
+            Ok(t) => t,
+            Err(e) => {
+                let class = e.to_class();
+                let snap = self.sessions.snapshot(&sid).await;
+                return Ok(envelope_err(
+                    snap,
+                    e,
+                    "Could not open transaction.",
+                    next_moves::on_error(class, Some(&database)),
+                ));
+            }
+        };
+
+        let short_id = format!("tx_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        {
+            let mut state = arc.lock().await;
+            state.tx = Some(OpenTx {
+                id: short_id,
+                database: database.clone(),
+                kind,
+                transaction,
+                last_activity: Instant::now(),
+            });
+        }
+        let snap = self.sessions.snapshot(&sid).await;
+        let moves = match kind {
+            TxKind::Read => next_moves::after_open_read(&database),
+            TxKind::Write => next_moves::after_open_write(&database),
+            TxKind::Schema => next_moves::after_open_schema(&database),
+        };
+        Ok(envelope_ok(snap, serde_json::json!({"opened": true}), moves))
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for TypeDbMcp {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::default();
+        info.instructions = Some(
+            "TypeDB safety-gated query server. Always call `get_schema` for a \
+             database before opening any transaction on it. Errors carry an \
+             `error.retriable_in_same_tx` boolean indicating whether the open \
+             transaction (if any) survived. See DESIGN.md for the full state \
+             machine."
+                .to_owned(),
+        );
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
+    }
+}
+
+// -- next_moves catalogue -------------------------------------------------
+
+mod next_moves {
+    use crate::error::ErrorClass;
+    use crate::typedb::TxKind;
+
+    pub fn after_list_databases() -> Vec<String> {
+        vec![
+            "Call `get_schema(database=<name>)` for any database before opening \
+             a transaction on it or calling `read_once`.".into(),
+        ]
+    }
+
+    pub fn after_get_schema(db: &str) -> Vec<String> {
+        vec![
+            format!("Open a transaction on `{db}`: `open_read(database=\"{db}\")` for \
+                     queries, `open_write(database=\"{db}\")` for mutations, or \
+                     `open_schema(database=\"{db}\")` for schema changes."),
+            format!("Or run a one-shot read with `read_once(database=\"{db}\", query=...)`."),
+        ]
+    }
+
+    pub fn after_open_read(db: &str) -> Vec<String> {
+        vec![
+            "Submit TypeQL with `query(query=\"match ...; fetch { ... };\")`. \
+             Repeat for as many reads as you need.".into(),
+            "Close the transaction with `rollback` when done. READ transactions \
+             cannot be committed (TypeDB will reject this with TSV2).".into(),
+            format!("Open transaction is on database `{db}`."),
+        ]
+    }
+
+    pub fn after_open_write(db: &str) -> Vec<String> {
+        vec![
+            "Submit TypeQL with `query(query=\"...\")`. Mix `match`/`fetch` reads with \
+             `insert`/`delete`/`update` writes as needed.".into(),
+            "End with `commit` to persist, or `rollback` to discard. A write that \
+             reaches TypeDB's write pipeline and fails will ABORT the transaction \
+             automatically; you'll then need to open a new one.".into(),
+            format!("Open transaction is on database `{db}`."),
+        ]
+    }
+
+    pub fn after_open_schema(db: &str) -> Vec<String> {
+        vec![
+            "Submit TypeQL `define` / `undefine` / `redefine` with \
+             `query(query=\"...\")`.".into(),
+            format!("End with `commit` to persist (this will CLEAR the schema-read \
+                     gate for `{db}` — you'll need to call \
+                     `get_schema(database=\"{db}\")` again before opening further \
+                     transactions on it), or `rollback` to discard."),
+        ]
+    }
+
+    pub fn after_query_ok(kind: TxKind) -> Vec<String> {
+        let close = match kind {
+            TxKind::Read => "Close with `rollback` when done (READ transactions cannot be committed).",
+            TxKind::Write => "End with `commit` to persist, or `rollback` to discard.",
+            TxKind::Schema => "End with `commit` to persist the schema change (which will clear the schema-read gate), or `rollback` to discard.",
+        };
+        vec![
+            "Continue with more `query` calls on the same transaction if needed.".into(),
+            close.into(),
+        ]
+    }
+
+    pub fn after_commit_ok(kind: TxKind, db: &str) -> Vec<String> {
+        let mut v = vec![
+            "Open another transaction with `open_read` / `open_write` / `open_schema`, \
+             or run a one-shot read with `read_once`.".into(),
+            "Or call `get_schema(database=<other>)` if you want to work on a different \
+             database.".into(),
+        ];
+        if matches!(kind, TxKind::Schema) {
+            v.insert(0, format!(
+                "The schema-read gate for `{db}` was cleared by this commit. Call \
+                 `get_schema(database=\"{db}\")` again before opening any transaction \
+                 on it."
+            ));
+        }
+        v
+    }
+
+    pub fn after_rollback_ok() -> Vec<String> {
+        vec![
+            "Open another transaction with `open_read` / `open_write` / `open_schema`, \
+             or run a one-shot read with `read_once`.".into(),
+            "Or call `get_schema(database=<other>)` to work on a different database."
+                .into(),
+        ]
+    }
+
+    pub fn after_read_once_ok() -> Vec<String> {
+        vec![
+            "Run another `read_once`, or call `get_schema(database=<other>)` for a \
+             different database.".into(),
+            "If you need multiple reads or any writes, open an explicit transaction \
+             with `open_read` / `open_write` / `open_schema`.".into(),
+        ]
+    }
+
+    pub fn on_upstream_unavailable() -> Vec<String> {
+        vec![
+            "Retry the call once — the TypeDB upstream was unreachable. If the error \
+             persists, the server is down or misconfigured; surface this to the human \
+             operator rather than looping.".into(),
+        ]
+    }
+
+    pub fn on_error(class: ErrorClass, db_hint: Option<&str>) -> Vec<String> {
+        use ErrorClass::*;
+        match class {
+            SchemaNotRead => {
+                let db = db_hint.unwrap_or("<name>");
+                vec![format!(
+                    "Call `get_schema(database=\"{db}\")` first, then retry this call."
+                )]
+            }
+            TxAlreadyOpen => vec![
+                "A transaction is already open in this session. Either continue using \
+                 it with `query`, then `commit`/`rollback`, or `rollback` it now and \
+                 retry this call.".into(),
+            ],
+            NoTxOpen => vec![
+                "Open a transaction first with `open_read` / `open_write` / \
+                 `open_schema`, or use `read_once` for a one-shot read.".into(),
+            ],
+            TxIsRead => vec![
+                "READ transactions are closed with `rollback`, not `commit`. Call \
+                 `rollback` instead.".into(),
+            ],
+            WrongTxType => vec![
+                "Your transaction is still open. Either issue a different query, or \
+                 `rollback` and open a transaction of the correct kind.".into(),
+            ],
+            ParseError | TypeError => vec![
+                "Your transaction is still open. Fix the query and call `query` again, \
+                 or `rollback` to start over.".into(),
+            ],
+            WriteFailed => vec![
+                "The transaction has been ABORTED by TypeDB. Open a new transaction \
+                 (typically `open_write`) to continue.".into(),
+                "Before retrying the failing write, consider re-reading the schema \
+                 (`get_schema`) or the relevant data — the constraint that fired tells \
+                 you something about reality you may not have known.".into(),
+            ],
+            CommitFailed => vec![
+                "The transaction is closed and no changes were persisted. Open a new \
+                 transaction with `open_write` (or `open_schema`) to retry.".into(),
+                "Before retrying, read back the existing data — a commit-time \
+                 cardinality violation often means another instance is required, or \
+                 you missed an attribute.".into(),
+            ],
+            ResultLimitExceeded => vec![
+                "Re-issue the query with `sort $k; offset N; limit M;` — `offset` MUST \
+                 come before `limit` (pipeline stages run in textual order). Your \
+                 transaction is still open.".into(),
+            ],
+            Timeout | IdleTimeout => vec![
+                "The transaction is gone. Open a new one with `open_read` / \
+                 `open_write` / `open_schema` to continue.".into(),
+            ],
+            UnknownDatabase => vec![
+                "Call `list_databases` to see the available database names.".into(),
+            ],
+            UpstreamUnavailable => on_upstream_unavailable(),
+        }
+    }
+}
+
+// -- envelope -------------------------------------------------------------
+
+#[derive(Serialize)]
+struct AgentEnvelope<'a> {
+    session: &'a SessionSnapshot,
+    next_moves: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ErrorPayload>,
+}
+
+#[derive(Serialize)]
+struct ErrorPayload {
+    class: ErrorClass,
+    message: String,
+    retriable_in_same_tx: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    typedb_codes: Option<Vec<String>>,
+}
+
+fn envelope_ok(
+    session: SessionSnapshot,
+    result: serde_json::Value,
+    next_moves: Vec<String>,
+) -> CallToolResult {
+    let env = AgentEnvelope {
+        session: &session,
+        next_moves,
+        result: Some(result),
+        error: None,
+    };
+    CallToolResult::success(vec![Content::text(
+        serde_json::to_string_pretty(&env).expect("envelope serialization"),
+    )])
+}
+
+fn envelope_err(
+    session: SessionSnapshot,
+    err: InternalError,
+    explanation: &str,
+    next_moves: Vec<String>,
+) -> CallToolResult {
+    let class = err.to_class();
+    let typedb_codes = match &err {
+        InternalError::Driver(d) => Some(extract_codes(&d.to_string())),
+        _ => None,
+    };
+    let message = format!("{explanation} (details: {err})");
+    let payload = ErrorPayload {
+        class,
+        message,
+        retriable_in_same_tx: class.retriable_in_same_tx(),
+        typedb_codes,
+    };
+    let env = AgentEnvelope {
+        session: &session,
+        next_moves,
+        result: None,
+        error: Some(payload),
+    };
+    CallToolResult::error(vec![Content::text(
+        serde_json::to_string_pretty(&env).expect("envelope serialization"),
+    )])
+}
+
+fn envelope_state_error(
+    session: SessionSnapshot,
+    class: ErrorClass,
+    message: &str,
+    next_moves: Vec<String>,
+) -> CallToolResult {
+    let payload = ErrorPayload {
+        class,
+        message: message.to_owned(),
+        retriable_in_same_tx: class.retriable_in_same_tx(),
+        typedb_codes: None,
+    };
+    let env = AgentEnvelope {
+        session: &session,
+        next_moves,
+        result: None,
+        error: Some(payload),
+    };
+    CallToolResult::error(vec![Content::text(
+        serde_json::to_string_pretty(&env).expect("envelope serialization"),
+    )])
+}
+
+fn explain_query_error(class: ErrorClass) -> String {
+    match class {
+        ErrorClass::ParseError =>
+            "TypeQL parse error. Your transaction is still open — fix the query and retry.".into(),
+        ErrorClass::TypeError =>
+            "TypeQL type-inference error (e.g. unknown type label). Your transaction is still open — fix the query and retry.".into(),
+        ErrorClass::WrongTxType =>
+            "Wrong transaction kind for this query. Your transaction is still open; rollback and open the correct kind, or issue a different query.".into(),
+        ErrorClass::WriteFailed =>
+            "Write failed and the transaction has been aborted by TypeDB. Open a new transaction to continue.".into(),
+        ErrorClass::CommitFailed =>
+            "Commit-time validation failed; the transaction is closed and no changes were persisted.".into(),
+        ErrorClass::ResultLimitExceeded =>
+            "Result set exceeded the server-side cap. Re-issue with `sort $k; offset N; limit M;` (offset MUST come before limit).".into(),
+        ErrorClass::Timeout =>
+            "Server-side query timeout; the transaction is closed.".into(),
+        ErrorClass::IdleTimeout =>
+            "Your transaction was closed (idle reaper or prior write error). Open a new one to continue.".into(),
+        _ => "Query failed; see error details.".into(),
+    }
+}
+
+fn extract_codes(message: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = message.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if let Some(end_rel) = message[i + 1..].find(']') {
+                let code = &message[i + 1..i + 1 + end_rel];
+                if !code.is_empty()
+                    && code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                {
+                    out.push(code.to_owned());
+                }
+                i += 1 + end_rel + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn session_id_from(ctx: &RequestContext<RoleServer>) -> SessionId {
+    if let Some(parts) = ctx.extensions.get::<axum::http::request::Parts>() {
+        if let Some(v) = parts.headers.get("mcp-session-id") {
+            if let Ok(s) = v.to_str() {
+                return SessionId(s.to_owned());
+            }
+        }
+    }
+    SessionId::stdio()
+}

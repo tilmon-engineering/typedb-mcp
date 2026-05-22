@@ -1,0 +1,22 @@
+[server]
+idle_timeout_s = 60
+result_cap     = 500
+listen_stdio   = true
+# listen_http  = "127.0.0.1:8765"     # not yet wired (see DESIGN.md §11)
+
+[typedb]
+address     = "127.0.0.1:1729"        # gRPC host:port; no scheme
+tls_enabled = false                   # set true for production / TLS-fronted servers
+
+[typedb.credentials]
+source       = "env"
+username_var = "TYPEDB_USER"
+password_var = "TYPEDB_PASS"
+
+# [typedb.credentials]
+# source   = "inline"
+# username = "admin"
+# password = "password"
+
+[logging]
+# audit_log_path = "/var/log/teng-typedb-mcp/audit.jsonl"
