@@ -14,10 +14,9 @@ contradicts `DESIGN.md`, update `DESIGN.md` first or push back on the
 change.
 
 The empirically verified TypeDB behaviour in `DESIGN.md` §5 (which error
-classes poison a transaction and which do not) was tested directly against
-`https://typedb.edge-01.tilmonengineering.com` on the date above. Treat that
-table as authoritative over anything you remember about TypeDB error
-handling.
+classes poison a transaction and which do not) was probed directly against
+TypeDB CE 3.10.4 (HTTP) and 3.11.1 (gRPC). Treat that table as authoritative
+over anything you remember about TypeDB error handling.
 
 ## Tech stack
 
@@ -76,8 +75,20 @@ drift.
 
 - Safe to edit: `src/`, `DESIGN.md`, `CLAUDE.md`, `Cargo.toml`.
 - The nine tools enumerated in `DESIGN.md` §7 are the entire agent-facing
-  surface. Adding a ninth tool is a design change, not an implementation
+  surface. Adding a tenth tool is a design change, not an implementation
   change — update `DESIGN.md` first.
+
+## Running and testing
+
+- `.mcp.json` is gitignored (each developer constructs their own).
+  `config.local.toml` is the committed per-developer wiring template that
+  `.mcp.json` points at via `TYPEDB_MCP_CONFIG`.
+- Tests live in `src/error.rs::tests` (classifier units), `tests/smoke_local.rs`
+  + `tests/smoke_integration.rs` (driver-level, gated on `TYPEDB_MCP_SMOKE=1`
+  with a live TypeDB at `127.0.0.1:1729`), and `tests/in_process.rs`
+  (in-process MCP client↔server over a tokio duplex; also gated on
+  `TYPEDB_MCP_SMOKE=1`).
+- Run gated tests with `TYPEDB_MCP_SMOKE=1 cargo test`.
 
 ## What is deliberately not here
 
