@@ -9,6 +9,7 @@ publish     = false
 [dependencies]
 rmcp = { version = "1.7", features = [
     "server",
+    "client",                              # used only by tests/in_process.rs
     "macros",
     "schemars",
     "transport-io",

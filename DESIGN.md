@@ -449,6 +449,3 @@ refresh — that is the driver's responsibility.
   inside `result`, or merge it into the error envelope.
 - Audit logging: the operator config field exists; the writer is not
   implemented.
-- Integration test that drives the MCP tools through an in-process rmcp
-  client → server pair, end-to-end (we have driver-level smoke and
-  transport-level smoke, but no test crossing both).
