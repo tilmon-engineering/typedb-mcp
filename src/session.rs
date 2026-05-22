@@ -61,10 +61,28 @@ impl SessionStore {
     /// then `.lock().await` the result for as long as they need.
     pub async fn get_or_create(&self, id: &SessionId) -> Arc<Mutex<SessionState>> {
         let mut guard = self.inner.lock().await;
-        guard
+        let existed = guard.contains_key(id);
+        let session = guard
             .entry(id.clone())
             .or_insert_with(|| Arc::new(Mutex::new(SessionState::default())))
-            .clone()
+            .clone();
+        let total = guard.len();
+        if existed {
+            tracing::debug!(
+                target: "typedb_mcp::session",
+                session_id = %id.0,
+                total_sessions = total,
+                "reused existing SessionStore entry",
+            );
+        } else {
+            tracing::info!(
+                target: "typedb_mcp::session",
+                session_id = %id.0,
+                total_sessions = total,
+                "created new SessionStore entry",
+            );
+        }
+        session
     }
 
     /// Snapshot the agent-visible session block. Acquires the session lock

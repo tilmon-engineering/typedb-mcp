@@ -97,7 +97,9 @@ async fn main() -> Result<()> {
             LocalSessionManager::default().into(),
             http_cfg,
         );
-        let router = axum::Router::new().nest_service("/mcp", service);
+        let router = axum::Router::new()
+            .nest_service("/mcp", service)
+            .layer(axum::middleware::from_fn(log_mcp_request));
 
         let ct_for_axum = shutdown.clone();
         Some(tokio::spawn(async move {
@@ -156,4 +158,49 @@ async fn main() -> Result<()> {
     }
     typedb.force_close();
     Ok(())
+}
+
+/// Diagnostic middleware: log every incoming /mcp request with the
+/// `Mcp-Session-Id` header value (or `<none>` if missing), method, path,
+/// and user-agent; then log the response status. Lets us tell whether
+/// clients are sending session IDs that we're failing to honour vs. not
+/// sending them at all (one-shot-per-call gateway behaviour).
+async fn log_mcp_request(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let session_id = req
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let user_agent = req
+        .headers()
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    tracing::info!(
+        target: "typedb_mcp::http",
+        %method,
+        path = %path,
+        mcp_session_id = session_id.as_deref().unwrap_or("<none>"),
+        user_agent = user_agent.as_deref().unwrap_or("<none>"),
+        "incoming HTTP request",
+    );
+
+    let response = next.run(req).await;
+
+    tracing::info!(
+        target: "typedb_mcp::http",
+        %method,
+        path = %path,
+        mcp_session_id = session_id.as_deref().unwrap_or("<none>"),
+        status = response.status().as_u16(),
+        "completed HTTP request",
+    );
+
+    response
 }
