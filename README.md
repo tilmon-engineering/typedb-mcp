@@ -1,7 +1,7 @@
 # typedb-mcp
 
 A safety-focused [Model Context Protocol](https://modelcontextprotocol.io)
-server that exposes a [TypeDB 3.x](https://typedb.com) database to an LLM
+server that exposes a [TypeDB 3.11+](https://typedb.com) database to an LLM
 agent. Written in Rust, built on the official `typedb-driver` (gRPC) and
 the `rmcp` SDK.
 
@@ -25,6 +25,11 @@ See [`DESIGN.md`](DESIGN.md) for the full contract.
   speaks gRPC on port `1729`. The upstream Python server speaks HTTP on
   port `8000`. This is the one place the "drop-in" framing breaks: point
   the container at the TypeDB **gRPC** endpoint.
+
+> **TypeDB version requirement.** This server requires **TypeDB 3.11.0
+> or newer**. Earlier 3.x releases are not supported — deployment
+> against 3.10.x and below has been observed to fail at the driver
+> layer.
 
 The MCP-facing surface (nine tools, served over Streamable HTTP at
 `/mcp`) matches upstream's intent. The wire-level behaviour is

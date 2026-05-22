@@ -2,8 +2,10 @@
 
 Last verified: 2026-05-22
 
-A Model Context Protocol server, written in Rust, that exposes a TypeDB 3.x
-database to an LLM agent through a connection-bound transaction model. The
+A Model Context Protocol server, written in Rust, that exposes a TypeDB
+3.11+ database to an LLM agent through a connection-bound transaction
+model. TypeDB 3.10.x and earlier are not supported — deployment against
+pre-3.11 servers fails at the driver layer. The
 design exists to **stop the agent from corrupting data through accidental
 mistypes, runaway queries, or careless commits** — while keeping the
 interaction surface small and explicit enough that a competent agent can use

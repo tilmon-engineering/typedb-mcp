@@ -2,8 +2,10 @@
 
 Last verified: 2026-05-22
 
-A safety-focused MCP server, written in Rust, that exposes a TypeDB 3.x
-database to an LLM agent through a connection-bound transaction model.
+A safety-focused MCP server, written in Rust, that exposes a TypeDB
+3.11+ database to an LLM agent through a connection-bound transaction
+model. **TypeDB 3.10.x and earlier are not supported** — deployment
+against pre-3.11 servers fails at the driver layer.
 
 ## Source of truth
 
