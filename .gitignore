@@ -2,3 +2,7 @@
 *.swp
 .env
 *.log
+
+# Claude Code project-local MCP config. Contains paths and credentials
+# specific to the local checkout; each developer constructs their own.
+.mcp.json

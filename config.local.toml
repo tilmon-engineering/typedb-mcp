@@ -1,0 +1,20 @@
+# Local development config — used by .mcp.json.
+# The binary reads this when TYPEDB_MCP_CONFIG points here.
+
+[server]
+idle_timeout_s = 60
+result_cap     = 500
+listen_stdio   = true
+# listen_http intentionally omitted: stdio-only when launched by .mcp.json.
+
+[typedb]
+address     = "127.0.0.1:1729"
+tls_enabled = false
+
+[typedb.credentials]
+source       = "env"
+username_var = "TYPEDB_USER"
+password_var = "TYPEDB_PASS"
+
+[logging]
+# audit_log_path = "/tmp/typedb-mcp-audit.jsonl"
