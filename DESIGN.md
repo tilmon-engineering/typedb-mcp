@@ -141,14 +141,26 @@ OpenTx {
    schema is now stale by its own action; force a re-read before any
    further work.
 7. **Idle reaper for open transactions.** A background task scans
-   sessions and rolls back any transaction whose `last_activity` is older
-   than `tx_idle_timeout_s` (default 60s, configurable, distinct from
-   `session_ttl_s`). The session keeps existing — only the transaction
-   is reaped. The agent learns about the reaping by getting an error on
-   its next call (no push notifications; see §2).
+   sessions and releases any transaction whose `last_activity` is older
+   than its per-kind idle timeout. The timeouts are asymmetric because
+   the costs are asymmetric: read transactions hold no uncommitted state
+   and don't block other transactions, so they're cheap to keep alive
+   across a long agent turn (`idle_timeout_read_s`, default 600s);
+   write and schema transactions hold uncommitted state and (for schema)
+   block other readers/writers, so they stay aggressive
+   (`idle_timeout_{write,schema}_s`, default 60s each). All three are
+   configurable and distinct from `session_ttl_s`. The session keeps
+   existing — only the transaction is reaped. The agent learns about
+   the reaping by getting an error on its next call (no push
+   notifications; see §2). The release mechanism depends on tx kind:
+   read transactions are released via `Transaction::close()` (a
+   client-side gRPC-stream teardown that the server acks before the
+   call returns); write and schema transactions are released via
+   `Transaction::rollback()` (which discards uncommitted writes). See
+   §5 for why this distinction matters.
 8. **Session reaper for whole sessions.** The same background task purges
    `SessionState` whose `expires_at` is in the past. If such a session
-   held an open tx, that tx is rolled back as part of the purge — a
+   held an open tx, that tx is released as part of the purge — a
    session purge is the strongest form of cleanup.
 
 ---
@@ -180,7 +192,11 @@ OpenTx {
               │     │           if was schema: clear schema_seen[db]
               │     └─ commit-time err -> tx None (DEAD path)
               ├─ rollback                -> tx None
-              └─ idle > idle_timeout_s   -> tx None (reaper)
+              │     (wire op: `close()` for read tx — TypeDB rejects
+              │      explicit `Rollback` on a read tx with [TSV3];
+              │      `rollback()` for write/schema. Agent verb unchanged.)
+              └─ idle > idle_timeout_<kind>_s -> tx None (reaper, same
+                                                wire-op rule as above)
 ```
 
 The DEAD state is observable but not persistent: as soon as the agent issues
@@ -204,6 +220,7 @@ TypeDB 3.x's error behaviour was probed against
 | Commit-time (cardinality, deferred)      | `... -> COW5 -> DCT3 -> TSV5 -> HSR18`                        | **NO**       |
 | Operation on already-dead tx             | `TSV12 "no open transaction" -> HSR16`                        | n/a          |
 | Concurrent-rollback transient (post-commit race) | `TSV13 "Execution interrupted by a concurrent transaction rollback" -> HSR16` | n/a (retry the call) |
+| Explicit `Rollback` sent against a read tx       | `TSV3 "Read transactions cannot be rolled back, since they never contain writes."` | n/a (driver-side bug if seen) |
 | Server-issued `session_id` not recognized | (server-internal: SessionStore lookup miss)                  | n/a          |
 | Server-issued `session_id` past TTL       | (server-internal: SessionStore lookup miss after purge)      | n/a          |
 
@@ -270,6 +287,29 @@ Example — fatal:
 > `email`. Your transaction has been aborted by TypeDB because the write
 > entered the data pipeline before failing. Open a new `write` transaction
 > to continue.
+
+### 5.0.1 Closing a read transaction
+
+The agent-facing `rollback` tool is the universal "I'm done, discard"
+verb. Under the hood it picks the correct wire op based on tx kind:
+
+- **Write / schema tx** — send the driver's `Transaction::rollback()`,
+  which sends a server-side `Rollback` request that discards
+  uncommitted writes. This is the right op here.
+- **Read tx** — send the driver's `Transaction::close()`, which signals
+  the gRPC stream shutdown and awaits the server's ack before
+  returning. We do **not** send `Rollback`, because TypeDB 3.x rejects
+  it with `[TSV3] Read transactions cannot be rolled back, since they
+  never contain writes.` Worse, the rejected request leaves the
+  server-side tx lingering until the stream tears down at its own
+  pace — and that lingering tx is the most likely source of the
+  `TSV13` (`TRANSIENT_CONFLICT`) bursts observed on rapid reads. The
+  `close()` path is synchronous: the server's view of the tx is gone
+  before the next call can be issued, so no collision.
+
+The same rule applies to all internal release paths: `read_once`,
+the explicit `rollback` tool, and both reaper paths (idle-tx and
+expired-session purge). See `OpenTx::release()` in `src/session.rs`.
 
 ### 5.1 Classifier strategy
 
@@ -551,11 +591,17 @@ returns rows 4-6.
 
 ```toml
 [server]
-idle_timeout_s   = 60     # tx-level: how long an open tx may sit idle before reap
-session_ttl_s    = 3600   # session-level: TTL on the SessionStore entry, refreshed on every call
-result_cap       = 500
-listen_stdio     = true
-listen_http      = "127.0.0.1:8765"     # null to disable
+# Per-kind tx idle timeouts. Asymmetric because the costs are
+# asymmetric: read tx hold no uncommitted state and don't block other
+# tx, so they get a long leash for slow agent turns; write/schema hold
+# state (schema also blocks readers) so they stay aggressive.
+idle_timeout_read_s   = 600    # default 600s (10 min)
+idle_timeout_write_s  = 60     # default 60s
+idle_timeout_schema_s = 60     # default 60s
+session_ttl_s         = 3600   # session-level: TTL on the SessionStore entry, refreshed on every call
+result_cap            = 500
+listen_stdio          = true
+listen_http           = "127.0.0.1:8765"     # null to disable
 
 [typedb]
 address     = "127.0.0.1:1729"                  # gRPC host:port; no scheme

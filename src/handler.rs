@@ -443,8 +443,10 @@ transaction is open, this is a no-op success.")]
             ));
         };
 
-        if let Err(e) = tx.transaction.rollback().await {
-            tracing::warn!(error = %e, "driver rollback returned an error");
+        // `release()` is rollback for write/schema, close for read — see
+        // `OpenTx::release` (K_00000053).
+        if let Err(e) = tx.release().await {
+            tracing::warn!(error = %e, kind = ?tx.kind, "driver tx release returned an error");
         }
         drop(state);
         let snap = SessionStore::snapshot_arc(&sid, &arc).await;
@@ -521,15 +523,13 @@ paginate with `sort $k; offset N; limit M;`.")]
 
         let result_cap = self.config.server.result_cap;
         let answer_result = tx.query(&p.query).await;
-        if let Err(e) = tx.rollback().await {
-            // Don't fail the call on rollback error — the agent already has its
-            // result. But don't swallow it: holding the session lock around
-            // rollback already prevents self-induced TSV13 on the SAME session
-            // (the next call can't open until this rollback returns), but a
-            // rollback that errors here can still leave the server tearing
-            // down. Logging gives operators a signal to correlate any TSV13
-            // burst from OTHER sessions with the read_once that preceded it.
-            tracing::warn!(error = %e, "read_once rollback returned an error");
+        // Close (not rollback) — TypeDB 3.x rejects an explicit `Rollback`
+        // on a read tx with `[TSV3]`, and the rejected request leaves the
+        // server-side tx lingering until the stream tears down. `close()`
+        // signals the gRPC stream shutdown and awaits ack, so the server
+        // releases the tx synchronously. This is the K_00000053 fix.
+        if let Err(e) = tx.close().await {
+            tracing::warn!(error = %e, "read_once close returned an error");
         }
         drop(state);
 

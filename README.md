@@ -210,9 +210,14 @@ in CWD, or `TYPEDB_MCP_CONFIG=/path/to/config.toml`):
 
 ```toml
 [server]
-session_ttl_s  = 3600                 # SessionStore entry TTL (default 60 min)
-idle_timeout_s = 60                   # tx-idle reaper (default 60 s)
-result_cap     = 500                  # max answers per query response
+session_ttl_s         = 3600          # SessionStore entry TTL (default 60 min)
+# Per-kind tx-idle reaper timeouts. Reads can hold for a long agent
+# turn cheaply (no uncommitted state, no blocking); writes/schema
+# stay aggressive (they hold state, schema blocks readers).
+idle_timeout_read_s   = 600           # default 600 s
+idle_timeout_write_s  = 60            # default  60 s
+idle_timeout_schema_s = 60            # default  60 s
+result_cap            = 500           # max answers per query response
 
 # Streamable HTTP Host-header allowlist. Omit to keep rmcp's loopback
 # default (localhost, 127.0.0.1, ::1) — fine for local stdio-style use.

@@ -3,6 +3,8 @@
 use serde::Deserialize;
 use std::{path::Path, time::Duration};
 
+use crate::typedb::TxKind;
+
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
@@ -14,8 +16,20 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
-    #[serde(default = "default_idle_timeout_s")]
-    pub idle_timeout_s: u64,
+    /// Idle timeout for READ transactions. Reads don't hold uncommitted
+    /// state and don't block other transactions, so the cost of letting an
+    /// agent hold one across a long LLM turn is just snapshot memory.
+    /// Default 600s.
+    #[serde(default = "default_idle_timeout_read_s")]
+    pub idle_timeout_read_s: u64,
+    /// Idle timeout for WRITE transactions. Writes hold uncommitted state,
+    /// so abandoned writes have real cost. Default 60s.
+    #[serde(default = "default_idle_timeout_write_s")]
+    pub idle_timeout_write_s: u64,
+    /// Idle timeout for SCHEMA transactions. Schema operations can block
+    /// other transactions, so we keep this aggressive. Default 60s.
+    #[serde(default = "default_idle_timeout_schema_s")]
+    pub idle_timeout_schema_s: u64,
     /// How long a server-issued session may sit idle before its
     /// `SessionStore` entry is purged (and any tx it held rolled back).
     /// Refreshed on every tool call that resolves the session. Default
@@ -71,7 +85,9 @@ pub struct LoggingConfig {
     pub audit_log_path: Option<String>,
 }
 
-fn default_idle_timeout_s() -> u64 { 60 }
+fn default_idle_timeout_read_s() -> u64 { 600 }
+fn default_idle_timeout_write_s() -> u64 { 60 }
+fn default_idle_timeout_schema_s() -> u64 { 60 }
 fn default_session_ttl_s() -> u64 { 3600 }
 fn default_result_cap() -> usize { 500 }
 fn default_true() -> bool { true }
@@ -83,8 +99,26 @@ impl Config {
         Ok(cfg)
     }
 
-    pub fn idle_timeout(&self) -> Duration {
-        Duration::from_secs(self.server.idle_timeout_s)
+    /// Idle timeout for a transaction of the given kind. See per-field docs
+    /// on `ServerConfig` for the per-kind rationale.
+    pub fn idle_timeout_for(&self, kind: TxKind) -> Duration {
+        let s = match kind {
+            TxKind::Read => self.server.idle_timeout_read_s,
+            TxKind::Write => self.server.idle_timeout_write_s,
+            TxKind::Schema => self.server.idle_timeout_schema_s,
+        };
+        Duration::from_secs(s)
+    }
+
+    /// Shortest of the three idle timeouts — used to set the reaper's tick
+    /// cadence so it can react promptly to whichever kind times out first.
+    pub fn min_idle_timeout(&self) -> Duration {
+        let s = self
+            .server
+            .idle_timeout_read_s
+            .min(self.server.idle_timeout_write_s)
+            .min(self.server.idle_timeout_schema_s);
+        Duration::from_secs(s)
     }
 
     pub fn session_ttl(&self) -> Duration {

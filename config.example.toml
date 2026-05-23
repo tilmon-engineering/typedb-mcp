@@ -1,8 +1,15 @@
 [server]
-idle_timeout_s = 60         # tx-level: idle reaper rolls back stale open transactions
-session_ttl_s  = 3600       # session-level: SessionStore entry TTL, refreshed on every call
-result_cap     = 500
-listen_stdio   = true
+# Per-kind tx idle timeouts. Reads can hold for ~10 min cheaply (no
+# uncommitted state, no blocking); writes/schema stay aggressive because
+# they hold state and may block other tx. Reaper uses these to decide
+# when an idle tx gets released — `close()` for read, `rollback()` for
+# write/schema.
+idle_timeout_read_s   = 600
+idle_timeout_write_s  = 60
+idle_timeout_schema_s = 60
+session_ttl_s         = 3600   # session-level: SessionStore entry TTL, refreshed on every call
+result_cap            = 500
+listen_stdio          = true
 # listen_http  = "127.0.0.1:8765"     # not yet wired (see DESIGN.md §11)
 # Host-header allowlist for the HTTP transport. Default (when omitted) is
 # rmcp's loopback set ["localhost", "127.0.0.1", "::1"] — fine for local

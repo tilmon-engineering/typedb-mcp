@@ -20,7 +20,7 @@ use typedb_mcp::{
     config::Config,
     handler::TypeDbMcp,
     session::{SessionStore, run_reaper},
-    typedb::TypeDbClient,
+    typedb::{TxKind, TypeDbClient},
 };
 
 #[tokio::main]
@@ -51,12 +51,21 @@ async fn main() -> Result<()> {
 
     let sessions = SessionStore::new();
 
-    // Reaper: rolls back idle transactions and purges expired sessions.
+    // Reaper: releases idle transactions and purges expired sessions.
+    // Per-kind idle timeouts (read/write/schema) — see DESIGN.md §3 and
+    // ServerConfig docs in src/config.rs. Reads are held longer because
+    // they don't pin uncommitted state and shouldn't be reaped out from
+    // under an agent's long LLM turn.
     {
         let s = sessions.clone();
-        let tx_idle = config.idle_timeout();
+        let read_idle = config.idle_timeout_for(TxKind::Read);
+        let write_idle = config.idle_timeout_for(TxKind::Write);
+        let schema_idle = config.idle_timeout_for(TxKind::Schema);
+        let tick = config.min_idle_timeout();
         let session_ttl = config.session_ttl();
-        tokio::spawn(async move { run_reaper(s, tx_idle, session_ttl).await });
+        tokio::spawn(async move {
+            run_reaper(s, read_idle, write_idle, schema_idle, tick, session_ttl).await
+        });
     }
 
     let shutdown = CancellationToken::new();

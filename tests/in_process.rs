@@ -31,7 +31,9 @@ fn enabled() -> bool {
 fn test_config() -> Config {
     Config {
         server: ServerConfig {
-            idle_timeout_s: 60,
+            idle_timeout_read_s: 600,
+            idle_timeout_write_s: 60,
+            idle_timeout_schema_s: 60,
             session_ttl_s: 3600,
             result_cap: 500,
             listen_stdio: true,

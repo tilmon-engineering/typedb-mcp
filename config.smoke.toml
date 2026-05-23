@@ -1,8 +1,10 @@
 [server]
-idle_timeout_s = 60
-result_cap     = 500
-listen_stdio   = false
-listen_http    = "127.0.0.1:8765"
+idle_timeout_read_s   = 600
+idle_timeout_write_s  = 60
+idle_timeout_schema_s = 60
+result_cap            = 500
+listen_stdio          = false
+listen_http           = "127.0.0.1:8765"
 
 [typedb]
 address     = "127.0.0.1:1729"

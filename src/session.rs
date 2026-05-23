@@ -47,6 +47,25 @@ pub struct OpenTx {
     pub last_activity: Instant,
 }
 
+impl OpenTx {
+    /// Release this transaction without committing. For READ transactions
+    /// this calls `Transaction::close()` (client-side gRPC-stream teardown);
+    /// TypeDB 3.x rejects an explicit `Rollback` on a read tx with `[TSV3]`,
+    /// AND the stream lingers server-side until the next reap — that lingering
+    /// tx is the most likely source of the TSV13 bursts the agent saw on
+    /// rapid reads. For WRITE / SCHEMA transactions we still send `Rollback`,
+    /// since the agent's intent is "discard the uncommitted writes."
+    ///
+    /// `close()` waits for the server to acknowledge the stream teardown,
+    /// so on return the server's view of this tx is gone.
+    pub async fn release(&self) -> Result<(), typedb_driver::Error> {
+        match self.kind {
+            TxKind::Read => self.transaction.close().await,
+            TxKind::Write | TxKind::Schema => self.transaction.rollback().await,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionState {
     pub schema_seen: HashSet<String>,
@@ -220,18 +239,27 @@ pub enum TxState {
 }
 
 /// Background reaper for both:
-/// 1. Open transactions whose `last_activity` exceeds `tx_idle_timeout`
-///    (the tx is rolled back; the session keeps existing).
+/// 1. Open transactions whose `last_activity` exceeds the per-kind idle
+///    timeout (the tx is released — `close()` for read, `rollback()` for
+///    write/schema; the session keeps existing).
 /// 2. Whole sessions whose `expires_at` has passed (the session is
-///    purged; any tx it held is rolled back as part of the purge).
+///    purged; any tx it held is released as part of the purge).
 ///
-/// Runs every `tx_idle_timeout / 4` (min 5s).
+/// Per-kind idle timeouts: reads can hold for a long agent turn cheaply
+/// (default 600s); writes and schema stay aggressive (default 60s) because
+/// they hold uncommitted state. See `ServerConfig` in src/config.rs.
+///
+/// `tick_hint` should be at most a quarter of the shortest of the three
+/// idle timeouts so the reaper reacts promptly to the most aggressive kind.
 pub async fn run_reaper(
     store: Arc<SessionStore>,
-    tx_idle_timeout: Duration,
+    read_idle: Duration,
+    write_idle: Duration,
+    schema_idle: Duration,
+    tick_hint: Duration,
     session_ttl: Duration,
 ) {
-    let tick = (tx_idle_timeout / 4).max(Duration::from_secs(5));
+    let tick = (tick_hint / 4).max(Duration::from_secs(5));
     loop {
         tokio::time::sleep(tick).await;
         let now = Instant::now();
@@ -249,12 +277,13 @@ pub async fn run_reaper(
             if purge {
                 if let Some(removed) = store.remove(&id).await {
                     if let Some(tx) = removed.lock().await.tx.take() {
-                        if let Err(e) = tx.transaction.rollback().await {
+                        if let Err(e) = tx.release().await {
                             tracing::warn!(
                                 target: "typedb_mcp::session",
                                 session_id = %id.0,
+                                kind = ?tx.kind,
                                 error = %e,
-                                "reaper: rollback on expired session failed",
+                                "reaper: tx release on expired session failed",
                             );
                         }
                     }
@@ -268,19 +297,22 @@ pub async fn run_reaper(
             }
 
             // Second check: tx-idle reaping for sessions that are still
-            // alive. We use `_session_ttl` only above; here we use the
-            // tx_idle_timeout.
+            // alive. Idle timeout is per-kind — reads get a longer leash.
             let mut state = arc.lock().await;
-            let should_reap_tx = state
-                .tx
-                .as_ref()
-                .is_some_and(|tx| now.duration_since(tx.last_activity) >= tx_idle_timeout);
+            let should_reap_tx = state.tx.as_ref().is_some_and(|tx| {
+                let kind_timeout = match tx.kind {
+                    crate::typedb::TxKind::Read => read_idle,
+                    crate::typedb::TxKind::Write => write_idle,
+                    crate::typedb::TxKind::Schema => schema_idle,
+                };
+                now.duration_since(tx.last_activity) >= kind_timeout
+            });
             if should_reap_tx {
                 if let Some(tx) = state.tx.take() {
-                    if let Err(e) = tx.transaction.rollback().await {
-                        tracing::warn!(?id, error = %e, "reaper: tx rollback failed");
+                    if let Err(e) = tx.release().await {
+                        tracing::warn!(?id, kind = ?tx.kind, error = %e, "reaper: tx release failed");
                     }
-                    tracing::info!(session = ?id.0, "reaper: rolled back idle transaction");
+                    tracing::info!(session = ?id.0, kind = ?tx.kind, "reaper: released idle transaction");
                 }
             }
             // session_ttl reference kept to silence unused-param warnings

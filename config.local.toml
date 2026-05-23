@@ -2,9 +2,14 @@
 # The binary reads this when TYPEDB_MCP_CONFIG points here.
 
 [server]
-idle_timeout_s = 60
-result_cap     = 500
-listen_stdio   = true
+# Per-kind transaction idle timeouts. Reads can hold across long agent
+# turns cheaply (no uncommitted state, no blocking); writes and schema
+# stay aggressive because they hold state and may block other tx.
+idle_timeout_read_s   = 600
+idle_timeout_write_s  = 60
+idle_timeout_schema_s = 60
+result_cap            = 500
+listen_stdio          = true
 # listen_http intentionally omitted: stdio-only when launched by .mcp.json.
 
 [typedb]

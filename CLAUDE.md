@@ -1,7 +1,9 @@
 # typedb-mcp
 
-Last verified: 2026-05-23 (added: OST positioning, rollout procedure;
-updated: per-session locking serializes tx work, see `src/handler.rs`)
+Last verified: 2026-05-23 (added: OST positioning, rollout procedure,
+per-session locking, per-kind idle timeouts; updated: read-tx release
+uses `Transaction::close()` not `Rollback` — see `DESIGN.md` §5.0.1 and
+`OpenTx::release()` in `src/session.rs`)
 
 A safety-focused MCP server, written in Rust, that exposes a TypeDB
 3.11+ database to an LLM agent through a connection-bound transaction
