@@ -469,6 +469,16 @@ paginate with `sort $k; offset N; limit M;`.")]
             Ok(r) => r,
             Err(env) => return Ok(env),
         };
+        // Hold the per-session lock across the ENTIRE read_once body
+        // (precondition checks → open tx → query → rollback). This serializes
+        // concurrent read_once calls on the same session, which is required by
+        // DESIGN.md §3 invariant 4 ("at most one transaction per session").
+        // The previous lock-window was scoped only to the precondition checks,
+        // which let two concurrent read_once calls both pass the `tx.is_some()`
+        // gate and overlap server-side — one's rollback collided with the
+        // other's open, surfacing as TSV13 (`TRANSIENT_CONFLICT`). The session
+        // model is single-agent / serial, so holding the lock through the
+        // network work is the correct serialization.
         let state = arc.lock().await;
 
         if state.tx.is_some() {
@@ -493,11 +503,11 @@ paginate with `sort $k; offset N; limit M;`.")]
                 next_moves::on_error(ErrorClass::SchemaNotRead, Some(&p.database)),
             ));
         }
-        drop(state);
 
         let tx = match self.typedb.open_transaction(&p.database, TxKind::Read).await {
             Ok(t) => t,
             Err(e) => {
+                drop(state);
                 let class = e.to_class();
                 let snap = SessionStore::snapshot_arc(&sid, &arc).await;
                 return Ok(envelope_err(
@@ -513,14 +523,15 @@ paginate with `sort $k; offset N; limit M;`.")]
         let answer_result = tx.query(&p.query).await;
         if let Err(e) = tx.rollback().await {
             // Don't fail the call on rollback error — the agent already has its
-            // result. But don't swallow it either: a rollback that errors here
-            // can leave the server still tearing down when the next tool call
-            // opens its tx, producing a TSV13 ("concurrent transaction
-            // rollback") on the next call. Logging the warning lets an
-            // operator correlate any TSV13 burst with the read_once that
-            // preceded it.
+            // result. But don't swallow it: holding the session lock around
+            // rollback already prevents self-induced TSV13 on the SAME session
+            // (the next call can't open until this rollback returns), but a
+            // rollback that errors here can still leave the server tearing
+            // down. Logging gives operators a signal to correlate any TSV13
+            // burst from OTHER sessions with the read_once that preceded it.
             tracing::warn!(error = %e, "read_once rollback returned an error");
         }
+        drop(state);
 
         let snap = SessionStore::snapshot_arc(&sid, &arc).await;
         match answer_result {
@@ -566,35 +577,41 @@ paginate with `sort $k; offset N; limit M;`.")]
             Ok(r) => r,
             Err(env) => return Ok(env),
         };
-        {
-            let state = arc.lock().await;
-            if state.tx.is_some() {
-                drop(state);
-                let snap = SessionStore::snapshot_arc(&sid, &arc).await;
-                return Ok(envelope_state_error(
-                    snap,
-                    ErrorClass::TxAlreadyOpen,
-                    "A transaction is already open in this session. Commit or rollback \
-                     it before opening another.",
-                    next_moves::on_error(ErrorClass::TxAlreadyOpen, None),
-                ));
-            }
-            if !state.schema_seen.contains(&database) {
-                drop(state);
-                let snap = SessionStore::snapshot_arc(&sid, &arc).await;
-                return Ok(envelope_state_error(
-                    snap,
-                    ErrorClass::SchemaNotRead,
-                    "Cannot open a transaction on this database: schema has not been \
-                     read this session. Call `get_schema(database)` first.",
-                    next_moves::on_error(ErrorClass::SchemaNotRead, Some(&database)),
-                ));
-            }
+        // Hold the per-session lock from precondition check through tx-stash.
+        // Same reasoning as read_once above: scoping the lock only to the
+        // precondition check let two concurrent open_* calls both pass the
+        // `tx.is_some()` gate and race on the network open, with the loser's
+        // tx getting silently overwritten when both raced to stash. Holding
+        // through the network call serializes them: the second open_* will
+        // see the first's tx in state and return TX_ALREADY_OPEN cleanly.
+        let mut state = arc.lock().await;
+        if state.tx.is_some() {
+            drop(state);
+            let snap = SessionStore::snapshot_arc(&sid, &arc).await;
+            return Ok(envelope_state_error(
+                snap,
+                ErrorClass::TxAlreadyOpen,
+                "A transaction is already open in this session. Commit or rollback \
+                 it before opening another.",
+                next_moves::on_error(ErrorClass::TxAlreadyOpen, None),
+            ));
+        }
+        if !state.schema_seen.contains(&database) {
+            drop(state);
+            let snap = SessionStore::snapshot_arc(&sid, &arc).await;
+            return Ok(envelope_state_error(
+                snap,
+                ErrorClass::SchemaNotRead,
+                "Cannot open a transaction on this database: schema has not been \
+                 read this session. Call `get_schema(database)` first.",
+                next_moves::on_error(ErrorClass::SchemaNotRead, Some(&database)),
+            ));
         }
 
         let transaction = match self.typedb.open_transaction(&database, kind).await {
             Ok(t) => t,
             Err(e) => {
+                drop(state);
                 let class = e.to_class();
                 let snap = SessionStore::snapshot_arc(&sid, &arc).await;
                 return Ok(envelope_err(
@@ -607,16 +624,14 @@ paginate with `sort $k; offset N; limit M;`.")]
         };
 
         let short_id = format!("tx_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-        {
-            let mut state = arc.lock().await;
-            state.tx = Some(OpenTx {
-                id: short_id,
-                database: database.clone(),
-                kind,
-                transaction,
-                last_activity: Instant::now(),
-            });
-        }
+        state.tx = Some(OpenTx {
+            id: short_id,
+            database: database.clone(),
+            kind,
+            transaction,
+            last_activity: Instant::now(),
+        });
+        drop(state);
         let snap = SessionStore::snapshot_arc(&sid, &arc).await;
         let moves = match kind {
             TxKind::Read => next_moves::after_open_read(&database),

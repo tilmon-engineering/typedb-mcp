@@ -354,6 +354,70 @@ async fn mcp_second_open_returns_tx_already_open() {
     let _ = server_handle.await;
 }
 
+// ---------- 3c. Parallel read_once on the same session serializes cleanly ----------
+
+// Regression: two read_once calls dispatched concurrently on the same session
+// must serialize at the handler boundary rather than racing on the server.
+// Before the lock-scope fix, the per-session lock was held only across the
+// precondition checks; both calls passed the `tx.is_some()` gate and opened
+// transactions back-to-back on the server, with one's `read_once`-internal
+// rollback colliding with the other's open and producing a TSV13
+// (`TRANSIENT_CONFLICT`) on one of the two responses. Holding the lock
+// across the full body (open → query → rollback) makes a second call wait
+// for the first to finish, so neither call surfaces TSV13.
+#[tokio::test]
+async fn mcp_parallel_read_once_serializes() {
+    if !enabled() { return; }
+    let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!("mcp_parallel_read_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    setup.create_database(&db).await.unwrap();
+    let schema_tx = setup
+        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .await
+        .unwrap();
+    schema_tx
+        .query("define attribute name, value string; entity widget, owns name @card(1..1);")
+        .await
+        .unwrap();
+    schema_tx.commit().await.unwrap();
+
+    // Arm the schema-read gate.
+    let _ = call(&client, "get_schema", with_sid(&sid, serde_json::json!({"database": db}))).await;
+
+    // Fire two read_once calls in parallel on the same session.
+    let q = serde_json::json!({
+        "database": db,
+        "query": "match $w isa widget, has name $n; fetch { \"name\": $n };",
+    });
+    let (r1, r2) = tokio::join!(
+        call(&client, "read_once", with_sid(&sid, q.clone())),
+        call(&client, "read_once", with_sid(&sid, q.clone())),
+    );
+
+    // Both must succeed without TSV13. Either ordering is fine; what matters
+    // is that neither surfaces TRANSIENT_CONFLICT (the symptom of the race).
+    for (label, r) in [("first", &r1), ("second", &r2)] {
+        let env = envelope(r);
+        if is_error(r) {
+            panic!(
+                "{label} parallel read_once errored — race not serialized: {env}"
+            );
+        }
+        // Sanity-check the read returned answers (empty array is fine — schema
+        // is loaded, table is empty).
+        assert!(env["result"]["answers"].is_array(), "{label}: answers array");
+    }
+
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+}
+
 // ---------- 4. Parse error preserves the transaction (recoverable) ----------
 
 #[tokio::test]
