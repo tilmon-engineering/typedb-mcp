@@ -511,7 +511,16 @@ paginate with `sort $k; offset N; limit M;`.")]
 
         let result_cap = self.config.server.result_cap;
         let answer_result = tx.query(&p.query).await;
-        let _ = tx.rollback().await;
+        if let Err(e) = tx.rollback().await {
+            // Don't fail the call on rollback error — the agent already has its
+            // result. But don't swallow it either: a rollback that errors here
+            // can leave the server still tearing down when the next tool call
+            // opens its tx, producing a TSV13 ("concurrent transaction
+            // rollback") on the next call. Logging the warning lets an
+            // operator correlate any TSV13 burst with the read_once that
+            // preceded it.
+            tracing::warn!(error = %e, "read_once rollback returned an error");
+        }
 
         let snap = SessionStore::snapshot_arc(&sid, &arc).await;
         match answer_result {
