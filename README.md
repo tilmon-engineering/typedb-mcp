@@ -301,4 +301,11 @@ TYPEDB_MCP_SMOKE=1 cargo test
 
 ## License
 
-MIT OR Apache-2.0.
+Dual-licensed under either of:
+
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or
+  <https://opensource.org/licenses/MIT>)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
+  <https://www.apache.org/licenses/LICENSE-2.0>)
+
+at your option.
