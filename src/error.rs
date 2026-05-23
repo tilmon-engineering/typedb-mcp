@@ -52,6 +52,15 @@ pub enum ErrorClass {
     UnknownDatabase,
     /// Idle reaper closed the tx before this call.
     IdleTimeout,
+    /// Benign transient: TypeDB aborted the call because of a concurrent
+    /// transaction rollback (`TSV13`). Most commonly observed on the very
+    /// first call issued after a successful commit (a post-commit race
+    /// inside the driver). No state is damaged — the agent should simply
+    /// reissue the failing call. There is no tx alive after this error
+    /// (TSV13 fires either with no tx open, or with one already torn down
+    /// by the conflict), so `retriable_in_same_tx` is false; the "retry"
+    /// guidance lives in the response's `next_moves`.
+    TransientConflict,
     /// TypeDB server unreachable / auth failure / generic upstream problem.
     UpstreamUnavailable,
     /// TypeDB returned an error this server does not know how to classify.
@@ -142,6 +151,11 @@ pub fn classify_typedb_error(top_code: &str, message: &str) -> ErrorClass {
         // "Operation failed: no open transaction." Means the tx was reaped
         // or aborted between calls; the *session* still exists.
         return ErrorClass::IdleTimeout;
+    }
+    if message.contains("[TSV13]") {
+        // "Execution interrupted by a concurrent transaction rollback."
+        // Benign transient — agent should retry the failing call as-is.
+        return ErrorClass::TransientConflict;
     }
     if message.contains("[TSV9]") || message.contains("[TSV8]") {
         return ErrorClass::WrongTxType;
@@ -450,6 +464,26 @@ mod tests {
         );
         assert_eq!(c, ErrorClass::UnknownDatabase);
         assert!(!c.retriable_in_same_tx());
+    }
+
+    // --- TSV13: concurrent rollback transient (K_00000052) ---------------
+
+    #[test]
+    fn tsv13_is_transient_conflict() {
+        // Observed on the very first call after a successful commit: a
+        // benign post-commit race that is safe to retry.
+        let c = classify_typedb_error(
+            "TSV13",
+            "[TSV13] Execution interrupted by a concurrent transaction rollback.\n[HSR16] Transaction error.",
+        );
+        assert_eq!(c, ErrorClass::TransientConflict);
+    }
+
+    #[test]
+    fn transient_conflict_has_no_live_tx() {
+        // No tx survives (none was open when TSV13 fired post-commit);
+        // the retry guidance lives in `next_moves`, not in this flag.
+        assert!(!ErrorClass::TransientConflict.retriable_in_same_tx());
     }
 
     #[test]

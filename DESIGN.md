@@ -203,6 +203,7 @@ TypeDB 3.x's error behaviour was probed against
 | Write-execution (regex, @values, etc.)   | `... -> WEX1 -> PEX6 -> QEX14 -> TSV11 -> HSR16`              | **NO**       |
 | Commit-time (cardinality, deferred)      | `... -> COW5 -> DCT3 -> TSV5 -> HSR18`                        | **NO**       |
 | Operation on already-dead tx             | `TSV12 "no open transaction" -> HSR16`                        | n/a          |
+| Concurrent-rollback transient (post-commit race) | `TSV13 "Execution interrupted by a concurrent transaction rollback" -> HSR16` | n/a (retry the call) |
 | Server-issued `session_id` not recognized | (server-internal: SessionStore lookup miss)                  | n/a          |
 | Server-issued `session_id` past TTL       | (server-internal: SessionStore lookup miss after purge)      | n/a          |
 
@@ -246,6 +247,7 @@ Mapping into agent-facing error classes:
 | `TIMEOUT`                 | server-side query timeout                         | **gone**  |
 | `UNKNOWN_DATABASE`        | database not present (TypeDB `SRV3`)              | unchanged |
 | `IDLE_TIMEOUT`            | tx was reaped before this call                    | none      |
+| `TRANSIENT_CONFLICT`      | concurrent-rollback transient (`TSV13`)           | none (retry the call) |
 | `UPSTREAM_UNAVAILABLE`    | TypeDB unreachable / auth failure                 | session-level |
 | `UNCLASSIFIED`            | TypeDB returned a code we don't recognize         | **gone**  |
 
@@ -285,9 +287,13 @@ strategy, matched in order:
    `SRV19` decide "commit failed → `COMMIT_FAILED`". These markers
    discriminate *fatality* regardless of which constraint (`CNT*`,
    `DVL*`, etc.) actually fired.
-2. **Specific TSV codes** — `TSV12`/`TSV9`/`TSV8`/`TSV2`/`TSV7`. The
+2. **Specific TSV codes** — `TSV12`/`TSV13`/`TSV9`/`TSV8`/`TSV2`/`TSV7`. The
    `TSV*` family is heterogeneous (commit-fatal, recoverable, dead-tx
-   marker, etc. all in one prefix), so it must be matched code-by-code.
+   marker, benign post-commit transient, etc. all in one prefix), so it
+   must be matched code-by-code. `TSV13` ("Execution interrupted by a
+   concurrent transaction rollback") is mapped to `TRANSIENT_CONFLICT`:
+   the agent is told to reissue the failing call as-is, since no state
+   was damaged.
 3. **Family prefixes** — whole families with one agent-facing class:
    `[INF*` and `[QUA*` → `TYPE_ERROR` (recoverable); `[TQL*` → `PARSE_ERROR`
    (recoverable); `[CNT*` and `[DVL*` → `WRITE_FAILED` (constraint or

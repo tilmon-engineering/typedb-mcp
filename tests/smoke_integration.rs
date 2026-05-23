@@ -157,6 +157,57 @@ async fn write_pipeline_error_aborts_tx() {
     client.delete_database(&db).await.expect("cleanup");
 }
 
+// ---------- 4b. write-pipeline abort DISCARDS prior writes in same tx ----------
+
+// K_00000052(2): empirical proof for the `next_moves` line that says every
+// write already submitted in the aborted tx is discarded. Insert a valid
+// person, then trigger a regex-violating insert in the same tx, then open a
+// fresh tx and assert the first person is NOT found.
+//
+// No integration fixture for TSV13 (the post-commit concurrent-rollback
+// transient): it's a driver-internal race we can't deterministically trigger
+// from a single-client smoke test. The classifier and `next_moves` shape are
+// covered by unit tests in `src/error.rs` and `src/handler.rs`; pretending we
+// have a live fixture for a race we can't provoke would be worse than not
+// having one.
+#[tokio::test]
+async fn write_pipeline_abort_discards_prior_writes() {
+    if !enabled() { return; }
+    let (client, db) = fresh_client_and_db("smoke_write_discard").await;
+    define_basic_schema(&client, &db).await;
+
+    let tx = client.open_transaction(&db, TxKind::Write).await.unwrap();
+    tx.query("insert $p isa person, has name \"Dora\";")
+        .await
+        .expect("prior insert accepted by the tx");
+    let bad = tx
+        .query("insert $p isa person, has name \"Eli\", has email \"not-an-email\";")
+        .await;
+    let class = typedb_mcp::error::classify_driver_error(&bad.expect_err("regex violation"));
+    assert_eq!(class, ErrorClass::WriteFailed);
+
+    // The aborted tx is gone; the question is whether Dora survived. She must not.
+    let tx = client.open_transaction(&db, TxKind::Read).await.unwrap();
+    let answer = tx
+        .query("match $p isa person, has name \"Dora\"; fetch { \"name\": $p.name };")
+        .await
+        .expect("read ok");
+    let json = query_answer_to_json(answer, 500).await.expect("materialize");
+    let v = json.into_value();
+    let empty = v
+        .get("answers")
+        .and_then(|a| a.as_array())
+        .map(|a| a.is_empty())
+        .unwrap_or(false);
+    assert!(
+        empty,
+        "Dora must have been discarded with the aborted tx; got {v}"
+    );
+    let _ = tx.rollback().await;
+
+    client.delete_database(&db).await.expect("cleanup");
+}
+
 // ---------- 5. commit-time cardinality error ----------
 
 #[tokio::test]

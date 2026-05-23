@@ -870,11 +870,16 @@ mod next_moves {
                  `rollback(session_id=...)` to start over.".into(),
             ],
             WriteFailed => vec![
-                "The transaction has been ABORTED by TypeDB. Open a new transaction \
-                 (typically `open_write(session_id=..., database=...)`) to continue. \
-                 The schema-read gate is still valid (no schema change happened), so \
+                "The transaction has been ABORTED by TypeDB. Every write you had \
+                 already submitted in it is also DISCARDED — including any prior \
+                 `insert` / `delete` / `update` calls that returned success in that \
+                 same transaction. None of them reached durable storage. Open a new \
+                 transaction (typically `open_write(session_id=..., database=...)`) \
+                 and re-apply every one of those prior writes in it before issuing \
+                 your replacement for the failing write.".into(),
+                "The schema-read gate is still valid (no schema change happened), so \
                  you do NOT need to call `get_schema` again before the next \
-                 `open_*`.".into(),
+                 `open_*`. This is unrelated to your *data* writes, which are gone.".into(),
                 "Before retrying the failing write, consider re-reading the relevant \
                  *data* (the constraint that fired tells you something about reality \
                  you may not have known). Re-reading the schema is optional — useful \
@@ -892,6 +897,14 @@ mod next_moves {
                 "Re-issue the query with `sort $k; offset N; limit M;` — `offset` MUST \
                  come before `limit` (pipeline stages run in textual order). Your \
                  transaction is still open.".into(),
+            ],
+            TransientConflict => vec![
+                "TypeDB aborted this call because of a concurrent transaction \
+                 rollback (TSV13). This is a benign transient — most commonly seen \
+                 on the first call issued right after a successful `commit`. No \
+                 state was damaged; simply retry the failing call as-is. If the \
+                 same call fails this way more than a couple of times in a row, \
+                 escalate (it is no longer a transient).".into(),
             ],
             Timeout | IdleTimeout => vec![
                 "The transaction is gone. Open a new one with `open_read` / \
@@ -913,6 +926,50 @@ mod next_moves {
                  error code post-dating this server's classifier, and someone needs to \
                  update `classify_typedb_error` in `src/error.rs` to recognize it.".into(),
             ],
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn write_failed_next_moves_warn_prior_writes_are_discarded() {
+            // K_00000052(2): the previous wording said "the tx is gone, open a
+            // new one" but did not make explicit that ALL writes already
+            // submitted in the aborted tx are also lost. Agents misread it as
+            // "only the failing query was rolled back" and proceeded as if
+            // earlier successful inserts had persisted.
+            let moves = on_error(ErrorClass::WriteFailed, None);
+            let joined = moves.join(" ").to_lowercase();
+            assert!(
+                joined.contains("discarded") || joined.contains("not reached"),
+                "WriteFailed next_moves must explicitly state prior writes are \
+                 discarded; got {moves:?}"
+            );
+            assert!(
+                joined.contains("re-apply") || joined.contains("reapply"),
+                "WriteFailed next_moves must direct the agent to re-apply prior \
+                 writes; got {moves:?}"
+            );
+        }
+
+        #[test]
+        fn transient_conflict_next_moves_direct_retry() {
+            // K_00000052(1): TSV13 is benign — the agent should be told to
+            // retry the failing call as-is rather than be left guessing.
+            let moves = on_error(ErrorClass::TransientConflict, None);
+            let joined = moves.join(" ").to_lowercase();
+            assert!(
+                joined.contains("retry"),
+                "TransientConflict next_moves must tell the agent to retry; \
+                 got {moves:?}"
+            );
+            assert!(
+                joined.contains("tsv13") || joined.contains("transient"),
+                "TransientConflict next_moves should name the cause so the \
+                 operator can recognize it on recurrence; got {moves:?}"
+            );
         }
     }
 }
