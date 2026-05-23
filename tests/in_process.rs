@@ -420,6 +420,117 @@ async fn mcp_parallel_read_once_serializes() {
     let _ = server_handle.await;
 }
 
+// ---------- 3d. K_00000053 regression: read_once must NOT emit TSV3 ----------
+//
+// TypeDB 3.x rejects an explicit `Rollback` on a read transaction with
+// `[TSV3] Read transactions cannot be rolled back, since they never contain
+// writes.` The K_00000053 fix routes read-tx release through
+// `Transaction::close()` instead of `.rollback()` so the server never
+// receives a Rollback request for a read tx. The TSV3 was emitted as a
+// swallowed `tracing::warn!` — the agent-facing response was successful, but
+// the log line revealed the bug. This test captures the WARN-level tracing
+// output for the duration of a `read_once` and asserts no TSV3 surfaces.
+//
+// If this ever fails, someone has reverted the close()-vs-rollback() rule.
+// See DESIGN.md §5.0.1.
+
+#[derive(Clone, Default)]
+struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureSink;
+    fn make_writer(&'a self) -> Self::Writer {
+        CaptureSink(self.0.clone())
+    }
+}
+
+struct CaptureSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+#[tokio::test]
+async fn mcp_read_once_does_not_emit_tsv3() {
+    if !enabled() { return; }
+
+    // Install a per-thread tracing subscriber that captures WARN+ into an
+    // in-memory buffer for the duration of this test. `#[tokio::test]`
+    // defaults to a current-thread runtime, so the spawned server task
+    // shares this thread and inherits the subscriber.
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer = CaptureWriter(captured.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!("mcp_no_tsv3_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    setup.create_database(&db).await.unwrap();
+    let schema_tx = setup
+        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .await
+        .unwrap();
+    schema_tx
+        .query("define attribute name, value string; entity widget, owns name @card(1..1);")
+        .await
+        .unwrap();
+    schema_tx.commit().await.unwrap();
+
+    let _ = call(&client, "get_schema", with_sid(&sid, serde_json::json!({"database": db}))).await;
+
+    // Run several read_once calls sequentially — each opens and releases a
+    // read tx. If any release goes through `rollback()` instead of `close()`,
+    // the server rejects with TSV3 and the handler emits a swallowed warn.
+    for _ in 0..5 {
+        let r = call(
+            &client,
+            "read_once",
+            with_sid(&sid, serde_json::json!({
+                "database": db,
+                "query": "match $w isa widget, has name $n; fetch { \"name\": $n };",
+            })),
+        )
+        .await;
+        assert!(!is_error(&r), "read_once succeeded: {r:?}");
+    }
+
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+
+    // Inspect captured logs. TSV3 is the canary; the swallowed warn message
+    // is the additional signal that someone reverted the wire op.
+    let logs = String::from_utf8(captured.lock().unwrap().clone())
+        .expect("captured logs are utf8");
+    assert!(
+        !logs.contains("TSV3"),
+        "K_00000053 regression: TSV3 emitted during read_once — read tx is \
+         being released via rollback() instead of close(). Captured logs:\n{logs}"
+    );
+    assert!(
+        !logs.contains("read_once close returned an error"),
+        "read_once close path errored — unexpected. Captured logs:\n{logs}"
+    );
+    assert!(
+        !logs.contains("read_once rollback returned an error"),
+        "read_once still calls rollback on a read tx (old K_00000053 bug path). \
+         Captured logs:\n{logs}"
+    );
+}
+
 // ---------- 4. Parse error preserves the transaction (recoverable) ----------
 
 #[tokio::test]
