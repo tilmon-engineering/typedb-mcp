@@ -21,6 +21,7 @@ use std::{
 use serde::Serialize;
 use tokio::sync::Mutex;
 
+use crate::extensions::Extensions;
 use crate::typedb::{DriverTransaction, TxKind};
 
 /// Opaque server-issued session identifier (UUID v4 string).
@@ -73,6 +74,11 @@ pub struct SessionState {
     /// Absolute deadline for this session. Set on `start_session`,
     /// refreshed to `now + session_ttl` on every successful tool call.
     pub expires_at: Instant,
+    /// Per-session typemap for library consumers. See DESIGN.md §3a and
+    /// the [`Extensions`] docs. The kernel never reads from this slot;
+    /// it lives and dies with the session and is purged with the rest of
+    /// `SessionState` on session expiry.
+    pub extensions: Extensions,
 }
 
 /// Result of resolving a `session_id` parameter against the store.
@@ -105,6 +111,7 @@ impl SessionStore {
             schema_seen: HashSet::new(),
             tx: None,
             expires_at: Instant::now() + ttl,
+            extensions: Extensions::new(),
         };
         let mut guard = self.inner.lock().await;
         guard.insert(id.clone(), Arc::new(Mutex::new(state)));

@@ -17,7 +17,7 @@ use rmcp::{
     ClientHandler, ServiceExt,
     model::{CallToolRequestParams, CallToolResult, ClientInfo},
 };
-use typedb_mcp::{
+use typedb_mcp_core::{
     config::{Config, Credentials, LoggingConfig, ServerConfig, TypeDbConfig},
     handler::TypeDbMcp,
     session::SessionStore,
@@ -225,7 +225,7 @@ async fn mcp_full_write_lifecycle() {
 
     // Pre-create a schema (the MCP tool only exposes get_schema, not define).
     let schema_tx = setup
-        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
         .await
         .unwrap();
     schema_tx
@@ -321,7 +321,7 @@ async fn mcp_second_open_returns_tx_already_open() {
     let db = format!("mcp_already_open_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
-        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
         .await
         .unwrap();
     schema_tx
@@ -379,7 +379,7 @@ async fn mcp_parallel_read_once_serializes() {
     let db = format!("mcp_parallel_read_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
-        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
         .await
         .unwrap();
     schema_tx
@@ -480,7 +480,7 @@ async fn mcp_read_once_does_not_emit_tsv3() {
     let db = format!("mcp_no_tsv3_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
-        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
         .await
         .unwrap();
     schema_tx
@@ -545,7 +545,7 @@ async fn mcp_parse_error_keeps_tx_open() {
     let db = format!("mcp_parse_err_{}", &uuid::Uuid::new_v4().to_string()[..8]);
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
-        .open_transaction(&db, typedb_mcp::typedb::TxKind::Schema)
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
         .await
         .unwrap();
     schema_tx

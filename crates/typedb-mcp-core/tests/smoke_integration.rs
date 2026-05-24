@@ -15,7 +15,7 @@
 //! This is the closest empirical check we have that the driver-based
 //! error classifier matches the live TypeDB behavior.
 
-use typedb_mcp::{
+use typedb_mcp_core::{
     error::ErrorClass,
     typedb::{TxKind, TypeDbClient, query_answer_to_json},
 };
@@ -84,7 +84,7 @@ async fn parse_error_leaves_tx_open() {
     let tx = client.open_transaction(&db, TxKind::Write).await.unwrap();
     let bad = tx.query("this is not valid typeql").await;
     let bad_err = bad.expect_err("parse should fail");
-    let class = typedb_mcp::error::classify_driver_error(&bad_err);
+    let class = typedb_mcp_core::error::classify_driver_error(&bad_err);
     eprintln!("parse-error class: {class:?}");
     assert_eq!(class, ErrorClass::ParseError);
     assert!(class.retriable_in_same_tx(), "DESIGN.md §5 says parse errors survive");
@@ -108,7 +108,7 @@ async fn type_error_leaves_tx_open() {
 
     let tx = client.open_transaction(&db, TxKind::Write).await.unwrap();
     let bad = tx.query("match $x isa nonexistent_type; fetch { $x.* };").await;
-    let class = typedb_mcp::error::classify_driver_error(&bad.expect_err("type err"));
+    let class = typedb_mcp_core::error::classify_driver_error(&bad.expect_err("type err"));
     eprintln!("type-error class: {class:?}");
     assert_eq!(class, ErrorClass::TypeError);
     assert!(class.retriable_in_same_tx());
@@ -132,7 +132,7 @@ async fn write_pipeline_error_aborts_tx() {
     let bad = tx
         .query("insert $p isa person, has name \"Bob\", has email \"not-an-email\";")
         .await;
-    let class = typedb_mcp::error::classify_driver_error(&bad.expect_err("regex violation"));
+    let class = typedb_mcp_core::error::classify_driver_error(&bad.expect_err("regex violation"));
     eprintln!("write-fail class: {class:?}");
     assert_eq!(class, ErrorClass::WriteFailed);
     assert!(!class.retriable_in_same_tx(), "DESIGN.md §5 says write-pipeline errors are fatal");
@@ -144,7 +144,7 @@ async fn write_pipeline_error_aborts_tx() {
     eprintln!("follow-up err (Debug):   {follow_err:?}");
     eprintln!("follow-up err code:      {}", follow_err.code());
     eprintln!("follow-up err message:   {}", follow_err.message());
-    let follow_class = typedb_mcp::error::classify_driver_error(&follow_err);
+    let follow_class = typedb_mcp_core::error::classify_driver_error(&follow_err);
     eprintln!("follow-up class:         {follow_class:?}");
     // Either variant is acceptable from a *safety* perspective: both signal
     // "the tx is gone, open a new one." The classifier just needs to map
@@ -183,7 +183,7 @@ async fn write_pipeline_abort_discards_prior_writes() {
     let bad = tx
         .query("insert $p isa person, has name \"Eli\", has email \"not-an-email\";")
         .await;
-    let class = typedb_mcp::error::classify_driver_error(&bad.expect_err("regex violation"));
+    let class = typedb_mcp_core::error::classify_driver_error(&bad.expect_err("regex violation"));
     assert_eq!(class, ErrorClass::WriteFailed);
 
     // The aborted tx is gone; the question is whether Dora survived. She must not.
@@ -220,7 +220,7 @@ async fn commit_time_cardinality_fails_at_commit() {
     // Insert a person *without* name — violates @card(1..1), but only at commit.
     tx.query("insert $p isa person, has age 30;").await.expect("insert accepted");
     let commit_err = tx.commit().await.expect_err("commit must fail");
-    let class = typedb_mcp::error::classify_driver_error(&commit_err);
+    let class = typedb_mcp_core::error::classify_driver_error(&commit_err);
     eprintln!("commit-fail class: {class:?}");
     assert_eq!(class, ErrorClass::CommitFailed);
 
@@ -237,7 +237,7 @@ async fn wrong_tx_type_is_recoverable() {
 
     let tx = client.open_transaction(&db, TxKind::Read).await.unwrap();
     let bad = tx.query("insert $p isa person, has name \"Frank\";").await;
-    let class = typedb_mcp::error::classify_driver_error(&bad.expect_err("write under read"));
+    let class = typedb_mcp_core::error::classify_driver_error(&bad.expect_err("write under read"));
     eprintln!("wrong-tx class: {class:?}");
     assert_eq!(class, ErrorClass::WrongTxType);
     assert!(class.retriable_in_same_tx());

@@ -5,7 +5,7 @@
 //!
 //!     TYPEDB_MCP_SMOKE=1 cargo test --test smoke_local -- --nocapture
 
-use typedb_mcp::typedb::{TxKind, TypeDbClient};
+use typedb_mcp_core::typedb::{TxKind, TypeDbClient};
 
 fn enabled() -> bool {
     std::env::var("TYPEDB_MCP_SMOKE").as_deref() == Ok("1")

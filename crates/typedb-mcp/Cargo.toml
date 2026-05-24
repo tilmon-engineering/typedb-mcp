@@ -1,0 +1,22 @@
+[package]
+name        = "typedb-mcp"
+description = "Safety-focused MCP server binary for TypeDB 3.x — see DESIGN.md."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "typedb-mcp"
+path = "src/main.rs"
+
+[dependencies]
+typedb-mcp-core = { path = "../typedb-mcp-core" }
+rmcp = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }

@@ -1,6 +1,9 @@
 # typedb-mcp — Design
 
-Last verified: 2026-05-22
+Last verified: 2026-05-24 (added: hybrid library+application positioning,
+§3a per-session extension state, §6.1 envelope stability, §7 tool-surface
+preface on library composition, §11 library extension API, §10 library
+prohibition note)
 
 A Model Context Protocol server, written in Rust, that exposes a TypeDB
 3.11+ database to an LLM agent through a connection-bound transaction
@@ -39,6 +42,20 @@ isolation, schema-enforced typing, atomic commit, and per-query error
 reporting, but it does not provide query-cost estimates, result caps,
 dry-run mode, or per-user role gating. The MCP layer adds those, plus the
 agent-facing state machine.
+
+### Hybrid library + application
+
+typedb-mcp ships in two shapes: a **server binary** with the ten tools
+enumerated in §7, and a **library crate** that exposes the same
+connection, session, transaction, and envelope machinery for other MCP
+servers to embed. A consuming server may mount the ten raw tools
+verbatim, prefix them, omit some, or add semantic tools of its own —
+but any TypeDB-backed tool it adds **must** go through the library's
+transaction helpers, so the safety thesis (this section), the
+schema-read gate (§3.5), the single-tx invariant (§3.4), the
+schema-commit clear rule (§3.6), and the response envelope (§6) hold
+uniformly across raw and semantic tools. The library API is described
+in §11; it is the authoritative integration surface.
 
 ---
 
@@ -162,6 +179,37 @@ OpenTx {
    `SessionState` whose `expires_at` is in the past. If such a session
    held an open tx, that tx is released as part of the purge — a
    session purge is the strongest form of cleanup.
+
+### 3a. Per-session extension state (library consumers)
+
+Library consumers building semantic tools on top of the kernel often
+need per-session state of their own (current focus entity, accepted
+disclaimers, a small query cache scoped to the agent's conversation).
+The kernel exposes a typemap-style `Extensions` slot on `SessionState`
+for this. Each consumer crate stashes its own concrete type:
+
+```rust
+// inside a consumer tool body
+session.extensions_mut(|ext| {
+    ext.get_or_insert_with::<MyFocus, _>(MyFocus::default).note(entity_id);
+}).await;
+```
+
+Rules:
+
+1. Extensions live and die with `SessionState`; the reaper purges them
+   alongside any open tx when the session is expired or removed.
+2. Access is mediated by the same per-session `Mutex` that protects
+   `schema_seen` and `tx`; consumers cannot hold an extension reference
+   across `await` points except inside the closure passed to
+   `extensions`/`extensions_mut`.
+3. Extensions never affect the schema-read gate, the single-tx
+   invariant, or the envelope shape. They are agent-invisible unless a
+   consumer's tool chooses to surface them in `result`.
+
+The kernel does not gossip extension data into `SessionSnapshot`. The
+agent's view of session state is exactly the §6 envelope and nothing
+more; consumer additions stay in consumer-emitted `result`/`error`.
 
 ---
 
@@ -398,6 +446,27 @@ operations exist at most states, and the agent should see all of them.
 The catalogue lives in CLAUDE.md so it can evolve without re-versioning
 this design document.
 
+### 6.1 Envelope stability (library consumers)
+
+The envelope above is the public agent-facing contract, not an
+implementation detail. Library consumers MUST:
+
+1. Emit the same outer shape: `session` + `next_moves` + exactly one of
+   `result` or `error`. The kernel's `ok` / `err` / `state_err` helpers
+   are the only sanctioned constructors; consumers should not
+   hand-build `Content::text` envelopes.
+2. Use `ErrorClass` values from this crate. The enum is closed and
+   versioned alongside this document. Novel semantic-level errors that
+   do not fit an existing class use `UNCLASSIFIED` with a tool-specific
+   `message` and `next_moves`.
+3. Build `next_moves` with the `NextMoves` builder (`default_for(class)`
+   plus tool-specific `.extended([...])` lines) so the prose register
+   stays consistent across raw and semantic tools.
+
+The envelope JSON shape is tagged with `ENVELOPE_VERSION` (currently 1).
+Any breaking change to the field set, the `ErrorClass` enum, or the
+session block requires a version bump and a DESIGN.md edit.
+
 Notes:
 
 - We do **not** emit `idle_s`, `auto_rollback_in_s`, or warning strings. They
@@ -427,6 +496,14 @@ Ten tools. The first, `start_session`, mints the `session_id` that every
 other tool requires (see §3). All non-`start_session` tools take
 `session_id: string` as a required argument and return `SESSION_UNKNOWN`
 or `SESSION_EXPIRED` if it does not resolve.
+
+The ten tools enumerated here are the defaults the **binary** mounts.
+Library consumers (§11) may prefix raw tool names, omit individual
+tools, or expose only a subset — subject to the safety thesis (§1): no
+consumer-added tool may compose into a `write_once` / `schema_once`
+shape, and any tool that opens a transaction must do so through the
+kernel's `with_*_tx` helpers so the schema-read gate and single-tx
+invariant remain enforced.
 
 ### 7.0 `start_session`
 
@@ -630,14 +707,235 @@ refresh — that is the driver's responsibility.
 - Query-cost estimation or dry-run mode (TypeDB does not expose these).
 - Result pagination as a first-class feature (the agent paginates with
   `offset; limit;`).
-- `write_once` / `schema_once` convenience tools (deliberately omitted).
+- `write_once` / `schema_once` convenience tools (deliberately omitted —
+  this prohibition applies to both the binary's tool surface *and* the
+  library API in §11; the kernel exposes no helper that composes into
+  a one-shot write).
 - Per-agent role-based access control. Access is governed by the credentials
   the operator gives the MCP server.
 - Streaming results. All query responses are batched and capped.
 
 ---
 
-## 11. Open work tracked against this design
+## 11. Library extension API
+
+This section is the contract for crate consumers who want to embed
+typedb-mcp's connection, session, and transaction machinery into their
+own MCP server alongside semantic tools of their own design. The binary
+in this repository (`src/main.rs`) is itself a consumer of this API and
+is the reference for "how to wire it up."
+
+### 11.1 What the library provides
+
+Three layers, named for the role they play:
+
+1. **The kernel** — `TypeDbCore`. A cheaply-cloneable `Arc` bundle of
+   the TypeDB driver client, the `SessionStore`, and the operator
+   config. One per process.
+2. **The session handle** — `SessionHandle<'_>`. The result of
+   `core.resolve(session_id)`. Carries the resolved `SessionId` plus
+   the per-session `Arc<Mutex<SessionState>>`. All transaction work and
+   envelope emission happens through methods on this handle so the
+   per-session lock is acquired with the right window every time.
+3. **The raw tool set** — `RawToolSet`. A builder over the ten tools
+   in §7 that consumers can mount into their `ServerHandler`, with
+   knobs for prefixing names, omitting individual tools, and (for the
+   binary) being mounted whole.
+
+### 11.2 What a consumer's semantic tool body looks like
+
+The intended shape, in full:
+
+```rust
+#[tool(description = "Find a customer by external id.")]
+async fn find_customer(
+    &self,
+    Parameters(p): Parameters<MyParams>,
+) -> Result<CallToolResult, McpError> {
+    let session = match self.core.resolve(&p.session_id).await {
+        Ok(s) => s,
+        Err(env) => return Ok(env),   // SESSION_UNKNOWN/EXPIRED envelope
+    };
+    Ok(session.with_read_tx(
+        "crm",
+        NextMoves::default_for_semantic("find_customer"),
+        |tx| async move {
+            let answer = tx.query(&typeql).await.map_err(InternalError::Driver)?;
+            // ... materialize answer ...
+            Ok(serde_json::json!({ "customer": ... }))
+        },
+    ).await)
+}
+```
+
+The body has no direct access to `SessionState`, no direct construction
+of `OpenTx`, no direct call to `Transaction::rollback`/`commit`/`close`,
+and no hand-built `CallToolResult`. Every invariant from §3 and §5 is
+enforced by the helper.
+
+### 11.3 The kernel API (sketch)
+
+```rust
+pub struct TypeDbCore {
+    pub config: Arc<Config>,
+    pub typedb: Arc<TypeDbClient>,
+    pub sessions: Arc<SessionStore>,
+}
+
+impl TypeDbCore {
+    pub async fn connect(cfg: CoreConfig) -> Result<Arc<Self>, InternalError>;
+    pub fn spawn_reaper(self: &Arc<Self>) -> tokio::task::JoinHandle<()>;
+
+    pub async fn start_session(&self) -> SessionId;
+
+    /// Resolve agent-supplied session_id. On miss/expiry, returns a
+    /// ready CallToolResult carrying the canonical envelope.
+    pub async fn resolve(&self, sid: &str)
+        -> Result<SessionHandle<'_>, CallToolResult>;
+}
+
+pub struct SessionHandle<'a> { /* &core, SessionId, Arc<Mutex<...>> */ }
+
+impl SessionHandle<'_> {
+    pub async fn snapshot(&self) -> SessionSnapshot;
+
+    pub async fn extensions<F, R>(&self, f: F) -> R
+        where F: AsyncFnOnce(&Extensions) -> R;
+    pub async fn extensions_mut<F, R>(&self, f: F) -> R
+        where F: AsyncFnOnce(&mut Extensions) -> R;
+
+    // --- the load-bearing transaction helpers (§3 + §5 invariants) ---
+
+    pub async fn with_read_tx<F, T>(
+        &self, database: &str, hints: NextMoves, f: F,
+    ) -> CallToolResult
+        where F: AsyncFnOnce(&DriverTransaction) -> Result<T, InternalError>,
+              T: Serialize;
+
+    pub async fn with_write_tx<F, T>(
+        &self, database: &str, hints: NextMoves, f: F,
+    ) -> CallToolResult
+        where F: AsyncFnOnce(&DriverTransaction) -> Result<TxOutcome<T>, InternalError>,
+              T: Serialize;
+
+    pub async fn with_schema_tx<F, T>(...)  -> CallToolResult;
+
+    /// Borrow the agent's currently-open tx (e.g. for a `query`-style
+    /// semantic tool). Emits NO_TX_OPEN envelope if none is open.
+    pub async fn with_current_tx<F, T>(
+        &self, hints: NextMoves, f: F,
+    ) -> CallToolResult
+        where F: AsyncFnOnce(&DriverTransaction, TxKind, &str)
+                    -> Result<T, InternalError>,
+              T: Serialize;
+
+    // --- envelope helpers (canonical §6 shape) ---
+
+    pub fn ok(&self, result: impl Serialize, hints: NextMoves) -> CallToolResult;
+    pub fn err(&self, err: InternalError, explanation: &str, hints: NextMoves)
+        -> CallToolResult;
+    pub fn state_err(&self, class: ErrorClass, msg: &str, hints: NextMoves)
+        -> CallToolResult;
+}
+
+pub enum TxOutcome<T> {
+    Commit(T),    // kernel issues commit(); on failure, COMMIT_FAILED envelope
+    Rollback(T),  // kernel issues the kind-correct release (§5.0.1)
+}
+```
+
+`with_*_tx` enforces:
+
+- Schema-read gate (`SCHEMA_NOT_READ` if the database's schema has not
+  been read in this session).
+- Single-tx invariant (`TX_ALREADY_OPEN` if a tx is already open).
+- Per-session lock held across precondition checks, network open, the
+  closure body, and the kind-correct release (§3 reasoning about
+  TSV13 races; the lock window choice is load-bearing).
+- Kind-correct release (`close()` for read, `rollback()` for
+  write/schema, per §5.0.1).
+- Error classification through `classify_typedb_error`, with the
+  resulting `ErrorClass` driving `retriable_in_same_tx` and whether
+  `state.tx` is cleared.
+- Envelope construction via `ok` / `err`.
+
+### 11.4 Mounting the raw tool set
+
+The binary's wiring (in `src/main.rs`) becomes one of:
+
+```rust
+// All ten tools, default names.
+let raw = RawToolSet::all(core.clone()).into_router();
+
+// Or selectively:
+let raw = RawToolSet::all(core.clone())
+    .with_prefix("tdb_")
+    .without(["read_once"])   // consumer is shadowing it
+    .into_router();
+```
+
+The router returned has a `Self` type that depends on the composition
+strategy (see §11.5). The binary's existing `TypeDbMcp` handler stays
+as a thin wrapper around `RawToolSet` so the binary's behaviour does
+not change.
+
+### 11.5 Composing raw tools into a consumer's handler
+
+`rmcp` 1.7's `ToolRouter<S>` can only be merged when both routers
+share the same `S`. This forces a composition choice the library MUST
+document (currently an open question being resolved in the
+implementation PR):
+
+- **Option A — embed-our-struct.** Consumer's handler holds a
+  `TypeDbMcp` field and uses rmcp's multi-router `+` feature to
+  combine routers, with their semantic tools defined on `TypeDbMcp`
+  via an extension trait. Simple but couples the consumer's tools to
+  our struct type.
+- **Option B — generic raw-tools router.** The library hand-writes
+  `pub fn raw_tools_router<H>(accessor: fn(&H) -> &Arc<TypeDbCore>)
+   -> ToolRouter<H>` without the `#[tool_router]` macro. The
+  consumer's handler is their own type; we generate routes whose
+  closures reach the kernel through `accessor`. Most ergonomic,
+  highest implementation cost.
+- **Option C — dispatch delegation.** The consumer implements
+  `ServerHandler::call_tool` and delegates name-prefixed tool calls
+  to an internal `TypeDbMcp`. Avoids router-merge entirely. Reasonable
+  for consumers with very few semantic tools.
+
+The chosen option is recorded here once the implementation lands; the
+others remain available to consumers with unusual needs.
+
+### 11.6 Versioning and stability
+
+- The kernel API (this section), the envelope shape (§6.1), and the
+  `ErrorClass` enum are SemVer-stable across patch releases of the
+  library crate. Breaking changes require a minor-version bump and a
+  DESIGN.md edit.
+- `rmcp` is a public dependency; the supported version range is
+  pinned in the library's `Cargo.toml` and bumped intentionally.
+- The binary depends on the library at the matching version; the two
+  are released in lockstep.
+
+### 11.7 Out of scope for the library (specifically)
+
+- No `with_write_once` / `with_schema_once` helper, ever. This is the
+  §1 thesis applied to the library API: a consumer who needs to write
+  exposes `open_write` (raw) plus a semantic tool that operates inside
+  the open tx via `with_current_tx`, or accepts that their semantic
+  mutation tool is a guided template the agent invokes inside an
+  explicit `open_write` → `query` → `commit` flow.
+- No public `OpenTx` or `DriverTransaction` outside a `with_*_tx`
+  closure. The lock window, `last_activity` bookkeeping, and
+  close-vs-rollback selection (§5.0.1) stay kernel-side.
+- No consumer extension of `ErrorClass`. The enum is closed; novel
+  errors use `UNCLASSIFIED`.
+- No per-process "extensions" slot on `TypeDbCore` (only per-session).
+  Consumers that need process-global state hold it on their own
+  handler struct alongside the `Arc<TypeDbCore>`.
+
+---
+
+## 12. Open work tracked against this design
 
 - Empirical: verify TypeDB behaviour under concurrent sessions hitting the
   same database (issue #6146 hints at concurrent-request error confusion).

@@ -1,15 +1,17 @@
-[package]
-name        = "typedb-mcp"
-version     = "0.1.0"
-edition     = "2024"
-description = "Safety-focused MCP server for TypeDB 3.x — see DESIGN.md"
-license     = "MIT OR Apache-2.0"
-publish     = false
+[workspace]
+resolver = "2"
+members = ["crates/typedb-mcp-core", "crates/typedb-mcp", "crates/example-semantic-mcp"]
 
-[dependencies]
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
 rmcp = { version = "1.7", features = [
     "server",
-    "client",                              # used only by tests/in_process.rs
+    "client",
     "macros",
     "schemars",
     "transport-io",
@@ -29,6 +31,3 @@ uuid = { version = "1", features = ["v4"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 futures = "0.3"
 tokio-util = "0.7"
-
-[dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }

@@ -1,9 +1,12 @@
 # typedb-mcp
 
-Last verified: 2026-05-23 (added: OST positioning, rollout procedure,
-per-session locking, per-kind idle timeouts; updated: read-tx release
-uses `Transaction::close()` not `Rollback` — see `DESIGN.md` §5.0.1 and
-`OpenTx::release()` in `src/session.rs`)
+Last verified: 2026-05-24 (workspace split: code now lives under
+`crates/typedb-mcp-core/` (library kernel), `crates/typedb-mcp/`
+(binary), `crates/example-semantic-mcp/` (worked consumer);
+`handler.rs` is now an 82-line thin wrapper dogfooding the public
+library API; new public extension API — `TypeDbCore`, `HasTypeDbCore`,
+`SessionHandle`, `TxOutcome`, `tools::raw_tools_router`, `Extensions`,
+and the full `envelope` module — see `DESIGN.md` §11).
 
 A safety-focused MCP server, written in Rust, that exposes a TypeDB
 3.11+ database to an LLM agent through a connection-bound transaction
@@ -38,9 +41,9 @@ ID-allocation discipline.
 
 **`DESIGN.md`** is the design contract for this project. Read it before
 making any change that touches the tool surface, the transaction state
-machine, the error semantics, or the response envelope. If a code change
-contradicts `DESIGN.md`, update `DESIGN.md` first or push back on the
-change.
+machine, the error semantics, the response envelope, or the public
+library API (§11). If a code change contradicts `DESIGN.md`, update
+`DESIGN.md` first or push back on the change.
 
 The empirically verified TypeDB behaviour in `DESIGN.md` §5 (which error
 classes poison a transaction and which do not) was probed directly against
@@ -112,25 +115,82 @@ the agent reasons about the server. If you find yourself omitting
 `next_moves`, surface that and update this file rather than letting it
 drift.
 
+## Workspace layout
+
+The repo is a Cargo workspace (root `Cargo.toml` is `[workspace]` with
+shared `[workspace.dependencies]`). Three members:
+
+- `crates/typedb-mcp-core/` — the library kernel. Owns `config`,
+  `core`, `envelope`, `error`, `extensions`, `handler`, `session`,
+  `tools`, `typedb`. Public re-exports in `lib.rs`. The ten raw tools
+  live in `tools::*` as free generic `fn`s over `H: HasTypeDbCore`
+  (not closures — see "rmcp gotchas" below) and are assembled by
+  `tools::raw_tools_router::<H>(RawToolsConfig)`. `handler.rs` is an
+  82-line thin wrapper that mounts that router on `TypeDbMcp`, i.e.
+  the binary dogfoods the public API.
+- `crates/typedb-mcp/` — the binary. Just `main.rs`; behaviour
+  unchanged from before the split.
+- `crates/example-semantic-mcp/` — worked consumer demonstrating the
+  library extension API.
+
+## Library extension API
+
+`typedb-mcp-core` is consumable as a library by other MCP servers that
+want TypeDB safety semantics plus semantic tools of their own. See
+`DESIGN.md` §11 for the authoritative surface and stability guarantees.
+Headline types: `TypeDbCore` (kernel bundle: `connect`, `start_session`,
+`resolve`, `spawn_reaper`); `HasTypeDbCore` trait (consumers implement
+on their handler to plug into the generic raw router); `SessionHandle`
+with `with_read_tx` / `with_write_tx` / `with_schema_tx` /
+`with_current_tx` (closures are `AsyncFnOnce` so `&tx` lifetime
+propagates), `extensions[_mut]`, `ok` / `err` / `state_err` envelope
+helpers; `TxOutcome::{Commit, Rollback}` for write/schema closures;
+`tools::raw_tools_router::<H>` with `with_prefix(...)` /
+`without([...])` knobs; per-session typemap `Extensions`; and the full
+`envelope` module (`AgentEnvelope`, `ErrorPayload`, `NextMoves`,
+`ENVELOPE_VERSION = 1`, `next_moves` catalogue,
+`envelope_state_error[_no_session]`, `extract_codes`,
+`explain_query_error`).
+
+## rmcp gotchas (worth not relearning)
+
+- `ToolRouter<S>::merge` requires identical `S`, so the raw tool set
+  is exposed as a generic `raw_tools_router::<H>` (Option B) rather
+  than a concrete router that consumers merge into their own.
+- Closures cannot satisfy rmcp 1.7's `CallToolHandler` HRTB
+  (`for<'a> FnOnce(&'a S, P) -> Pin<Box<dyn Future + Send + 'a>>`).
+  The rmcp macro sidesteps this by emitting free `fn` items;
+  hand-written generic routes in `tools::*` do the same. Do not
+  rewrite them as closures.
+
 ## Boundaries
 
-- Safe to edit: `src/`, `DESIGN.md`, `CLAUDE.md`, `Cargo.toml`.
+- Safe to edit: `crates/typedb-mcp-core/src/`, `crates/typedb-mcp/src/`,
+  `crates/example-semantic-mcp/src/`, `DESIGN.md`, `CLAUDE.md`, root
+  and per-crate `Cargo.toml`.
 - The ten tools enumerated in `DESIGN.md` §7 (`start_session` plus the
-  nine TypeDB-facing tools) are the entire agent-facing surface. Adding
-  an eleventh tool is a design change, not an implementation change —
-  update `DESIGN.md` first.
+  nine TypeDB-facing tools) are the entire agent-facing surface of the
+  reference binary. Adding an eleventh tool is a design change, not an
+  implementation change — update `DESIGN.md` first. (Library consumers
+  may of course add their own semantic tools alongside.)
+- The public surface re-exported from `typedb-mcp-core`'s `lib.rs` is
+  the library contract. Breaking changes there are a `DESIGN.md` §11
+  change first; see "Versioning and stability" in §11.6.
 
 ## Running and testing
 
 - `.mcp.json` is gitignored (each developer constructs their own).
   `config.local.toml` is the committed per-developer wiring template that
   `.mcp.json` points at via `TYPEDB_MCP_CONFIG`.
-- Tests live in `src/error.rs::tests` (classifier units), `tests/smoke_local.rs`
-  + `tests/smoke_integration.rs` (driver-level, gated on `TYPEDB_MCP_SMOKE=1`
-  with a live TypeDB at `127.0.0.1:1729`), and `tests/in_process.rs`
-  (in-process MCP client↔server over a tokio duplex; also gated on
+- Tests live in `crates/typedb-mcp-core/src/error.rs::tests` (classifier
+  units), `crates/typedb-mcp-core/tests/smoke_local.rs` +
+  `smoke_integration.rs` (driver-level, gated on `TYPEDB_MCP_SMOKE=1`
+  with a live TypeDB at `127.0.0.1:1729`), and
+  `crates/typedb-mcp-core/tests/in_process.rs` (in-process MCP
+  client↔server over a tokio duplex; also gated on
   `TYPEDB_MCP_SMOKE=1`).
-- Run gated tests with `TYPEDB_MCP_SMOKE=1 cargo test`.
+- Run gated tests with `TYPEDB_MCP_SMOKE=1 cargo test` (from the
+  workspace root; cargo picks up all members).
 
 ## Deploying a new image to edge-01
 

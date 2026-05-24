@@ -397,6 +397,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "example-semantic-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "typedb-mcp-core",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1798,12 +1813,25 @@ dependencies = [
  "axum 0.8.9",
  "futures",
  "rmcp",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "typedb-mcp-core",
+]
+
+[[package]]
+name = "typedb-mcp-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "rmcp",
  "schemars",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
- "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",

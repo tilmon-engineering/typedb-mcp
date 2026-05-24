@@ -16,7 +16,7 @@ use rmcp::{
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-use typedb_mcp::{
+use typedb_mcp_core::{
     config::Config,
     handler::TypeDbMcp,
     session::{SessionStore, run_reaper},
