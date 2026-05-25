@@ -3,10 +3,10 @@ FROM rust:1-bookworm AS builder
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
-COPY src ./src
+COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin typedb-mcp \
+    cargo build --release --locked -p typedb-mcp \
     && cp target/release/typedb-mcp /typedb-mcp \
     && strip /typedb-mcp
 

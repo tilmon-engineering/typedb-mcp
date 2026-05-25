@@ -18,6 +18,16 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-24
+
+### Fixed
+
+- Dockerfile updated for the workspace layout (`COPY crates ./crates`,
+  `cargo build -p typedb-mcp`). The previous `COPY src ./src` /
+  `--bin typedb-mcp` form had been broken since the workspace split
+  (`1173591`), so no GHCR image had been produced for `0.1.0` or
+  `0.1.1`. Verified with a local `podman build` before release.
+
 ## [0.1.1] — 2026-05-24
 
 ### Changed
