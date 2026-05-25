@@ -18,6 +18,20 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-24
+
+### Changed
+
+- `next_moves` hints for `open_read` / `open_write` / `open_schema` and
+  the corresponding `query`-success responses now explicitly state which
+  TypeQL statement kinds each transaction kind accepts. The schema-tx
+  hint previously enumerated only `define`/`undefine`/`redefine`, which
+  read as exhaustive and led agents to commit-and-reopen before running
+  reads. The hint now states that schema transactions accept schema
+  statements, data writes, AND reads in any order, and that write
+  transactions accept reads alongside writes. Hint-only change; the
+  query path already permitted these statement combinations.
+
 ## [0.1.0] — 2026-05-24
 
 ### Added

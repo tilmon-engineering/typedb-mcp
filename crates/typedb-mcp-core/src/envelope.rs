@@ -313,7 +313,10 @@ pub mod next_moves {
     pub fn after_open_read(db: &str) -> Vec<String> {
         vec![
             "Submit TypeQL with `query(session_id=..., query=\"match ...; \
-             fetch { ... };\")`. Repeat for as many reads as you need.".into(),
+             fetch { ... };\")`. Repeat for as many reads as you need. \
+             READ transactions accept reads ONLY — `insert`/`delete`/`update` \
+             and `define`/`undefine`/`redefine` will be rejected; open a \
+             write or schema transaction instead.".into(),
             "Close the transaction with `rollback(session_id=...)` when done. \
              READ transactions cannot be committed (TypeDB will reject this \
              with TSV2).".into(),
@@ -323,9 +326,13 @@ pub mod next_moves {
 
     pub fn after_open_write(db: &str) -> Vec<String> {
         vec![
-            "Submit TypeQL with `query(session_id=..., query=\"...\")`. Mix \
-             `match`/`fetch` reads with `insert`/`delete`/`update` writes as \
-             needed.".into(),
+            "Submit TypeQL with `query(session_id=..., query=\"...\")`. WRITE \
+             transactions accept reads AND data writes in any order: mix \
+             `match`/`fetch` with `insert`/`delete`/`update` freely within \
+             the same transaction. Reads see your in-tx writes \
+             (read-your-writes). Schema statements (`define`/`undefine`/\
+             `redefine`) are NOT permitted here — open a schema transaction \
+             for those.".into(),
             "End with `commit(session_id=...)` to persist, or \
              `rollback(session_id=...)` to discard. A write that reaches \
              TypeDB's write pipeline and fails will ABORT the transaction \
@@ -336,35 +343,56 @@ pub mod next_moves {
 
     pub fn after_open_schema(db: &str) -> Vec<String> {
         vec![
-            "Submit TypeQL `define` / `undefine` / `redefine` with \
-             `query(session_id=..., query=\"...\")`.".into(),
+            "Submit TypeQL with `query(session_id=..., query=\"...\")`. \
+             SCHEMA transactions are the most permissive kind: they accept \
+             `define`/`undefine`/`redefine` AND data writes (`insert`/\
+             `delete`/`update`) AND reads (`match`/`fetch`) in any order \
+             within the same transaction. You do NOT need to commit and \
+             reopen to run a read query — just issue another `query` call \
+             on this same session.".into(),
             format!("End with `commit(session_id=...)` to persist (this will \
                      CLEAR the schema-read gate for `{db}` — you'll need to \
                      call `get_schema(session_id=..., database=\"{db}\")` \
                      again before opening further transactions on it), or \
                      `rollback(session_id=...)` to discard."),
+            format!("Open transaction is on database `{db}`."),
         ]
     }
 
     pub fn after_query_ok(kind: TxKind, db: &str) -> Vec<String> {
-        let close: String = match kind {
-            TxKind::Read => "Close with `rollback(session_id=...)` when done (READ \
-                             transactions cannot be committed).".into(),
-            TxKind::Write => "End with `commit(session_id=...)` to persist, or \
-                              `rollback(session_id=...)` to discard.".into(),
-            TxKind::Schema => format!(
-                "End with `commit(session_id=...)` to persist the schema \
-                 change (which will CLEAR the schema-read gate for `{db}` — \
-                 you'll need to call `get_schema(session_id=..., \
-                 database=\"{db}\")` again before opening further \
-                 transactions on it), or `rollback(session_id=...)` to discard."
+        let (continue_hint, close): (String, String) = match kind {
+            TxKind::Read => (
+                "Continue with more `query(session_id=..., ...)` calls on \
+                 this READ transaction. Reads only — `insert`/`delete`/\
+                 `update` and `define`/`undefine`/`redefine` will be \
+                 rejected here.".into(),
+                "Close with `rollback(session_id=...)` when done (READ \
+                 transactions cannot be committed).".into(),
+            ),
+            TxKind::Write => (
+                "Continue with more `query(session_id=..., ...)` calls on \
+                 this WRITE transaction. Reads and data writes can be \
+                 interleaved freely; reads see your in-tx writes. Schema \
+                 statements are not permitted here.".into(),
+                "End with `commit(session_id=...)` to persist, or \
+                 `rollback(session_id=...)` to discard.".into(),
+            ),
+            TxKind::Schema => (
+                "Continue with more `query(session_id=..., ...)` calls on \
+                 this SCHEMA transaction. You can interleave schema \
+                 statements (`define`/`undefine`/`redefine`), data writes, \
+                 and reads (`match`/`fetch`) without committing in between.".into(),
+                format!(
+                    "End with `commit(session_id=...)` to persist (this \
+                     will CLEAR the schema-read gate for `{db}` — you'll \
+                     need to call `get_schema(session_id=..., \
+                     database=\"{db}\")` again before opening further \
+                     transactions on it), or `rollback(session_id=...)` \
+                     to discard."
+                ),
             ),
         };
-        vec![
-            "Continue with more `query(session_id=..., ...)` calls on the same \
-             transaction if needed.".into(),
-            close,
-        ]
+        vec![continue_hint, close]
     }
 
     pub fn after_commit_ok(kind: TxKind, db: &str) -> Vec<String> {

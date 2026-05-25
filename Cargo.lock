@@ -398,7 +398,7 @@ dependencies = [
 
 [[package]]
 name = "example-semantic-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "rmcp",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "typedb-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "axum 0.8.9",
@@ -1822,7 +1822,7 @@ dependencies = [
 
 [[package]]
 name = "typedb-mcp-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "futures",
