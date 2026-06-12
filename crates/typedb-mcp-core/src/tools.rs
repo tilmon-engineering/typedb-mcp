@@ -743,41 +743,40 @@ async fn do_read_once(core: &TypeDbCore, p: ReadOnceParams) -> CallToolResult {
         }
     };
     let result_cap = core.config.server.result_cap;
-    let answer_result = tx.query(&p.query).await;
+    // Materialize the answer stream BEFORE closing the transaction. The
+    // driver's QueryAnswer is a lazy gRPC stream tied to the live tx;
+    // close() tears that stream down synchronously, so draining after
+    // close aborts with TSV13 (self-inflicted, not a concurrent conflict).
+    let json_result = match tx.query(&p.query).await {
+        Ok(answer) => query_answer_to_json(answer, result_cap).await,
+        Err(e) => Err(InternalError::Driver(e)),
+    };
     if let Err(e) = tx.close().await {
         tracing::warn!(error = %e, "read_once close returned an error");
     }
     drop(state);
     let snap = session.snapshot().await;
-    match answer_result {
-        Ok(answer) => match query_answer_to_json(answer, result_cap).await {
-            Ok(json) => {
-                if json.truncated {
-                    envelope_state_error(
-                        snap,
-                        ErrorClass::ResultLimitExceeded,
-                        &format!(
-                            "Query returned more than {result_cap} answers (server cap). \
-                             Re-issue via `read_once` (or an explicit `open_read`) with \
-                             `sort $k; offset N; limit M;` (`offset` MUST come before `limit`)."
-                        ),
-                        NextMoves::default_for(ErrorClass::ResultLimitExceeded, None).into_inner(),
-                    )
-                } else {
-                    envelope_ok(snap, json.into_value(), next_moves::after_read_once_ok())
-                }
+    match json_result {
+        Ok(json) => {
+            if json.truncated {
+                envelope_state_error(
+                    snap,
+                    ErrorClass::ResultLimitExceeded,
+                    &format!(
+                        "Query returned more than {result_cap} answers (server cap). \
+                         Re-issue via `read_once` (or an explicit `open_read`) with \
+                         `sort $k; offset N; limit M;` (`offset` MUST come before `limit`)."
+                    ),
+                    NextMoves::default_for(ErrorClass::ResultLimitExceeded, None).into_inner(),
+                )
+            } else {
+                envelope_ok(snap, json.into_value(), next_moves::after_read_once_ok())
             }
-            Err(e) => {
-                let class = e.to_class();
-                let moves = next_moves::on_error(class, Some(&p.database));
-                envelope_err(snap, e, &explain_query_error(class), moves)
-            }
-        },
+        }
         Err(e) => {
-            let internal = InternalError::Driver(e);
-            let class = internal.to_class();
+            let class = e.to_class();
             let moves = next_moves::on_error(class, Some(&p.database));
-            envelope_err(snap, internal, &explain_query_error(class), moves)
+            envelope_err(snap, e, &explain_query_error(class), moves)
         }
     }
 }

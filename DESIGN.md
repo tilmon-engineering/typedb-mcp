@@ -359,6 +359,17 @@ The same rule applies to all internal release paths: `read_once`,
 the explicit `rollback` tool, and both reaper paths (idle-tx and
 expired-session purge). See `OpenTx::release()` in `src/session.rs`.
 
+**Release only after the answer stream is fully materialized.** The
+driver's `QueryAnswer` is a lazy gRPC stream tied to the live
+transaction, not data. Any release (`close()` included) tears the
+stream down: draining after release aborts — server-side `TSV13`
+under driver 3.11.1, client-side `CXN07` under 3.11.5. `read_once`
+shipped with this ordering inverted (query → close → drain) and
+failed deterministically on any result set larger than the driver's
+prefetch batch; the regression test
+`mcp_read_once_returns_full_multibatch_result` pins the corrected
+order.
+
 ### 5.1 Classifier strategy
 
 TypeDB defines ~70 error-code prefixes and ~300 individual codes via a

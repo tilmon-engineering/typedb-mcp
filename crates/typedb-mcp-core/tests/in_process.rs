@@ -531,6 +531,87 @@ async fn mcp_read_once_does_not_emit_tsv3() {
     );
 }
 
+// ---------- 3e. read_once must drain the answer stream before close ----------
+//
+// Regression: do_read_once used to call `tx.close()` between `tx.query()`
+// and `query_answer_to_json()`. The driver's QueryAnswer is a lazy gRPC
+// stream tied to the live transaction, so draining after close aborts with
+// TSV13 ("execution interrupted by a concurrent transaction close") — but
+// only when the result set is large enough that the driver must pull
+// batches beyond the one prefetched with the query response. Tiny one-row
+// results (like the other tests here) pass either way, which is how the
+// bug escaped CI while failing 100% of the time against real databases.
+// This test inserts enough rows to force multi-batch streaming and asserts
+// the rows actually come back.
+
+#[tokio::test]
+async fn mcp_read_once_returns_full_multibatch_result() {
+    if !enabled() { return; }
+    let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!("mcp_read_once_drain_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    setup.create_database(&db).await.unwrap();
+    let schema_tx = setup
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
+        .await
+        .unwrap();
+    schema_tx
+        .query("define attribute name, value string; entity widget, owns name @card(1..1);")
+        .await
+        .unwrap();
+    schema_tx.commit().await.unwrap();
+
+    // 400 rows: comfortably under the test result_cap of 500, but well past
+    // any single prefetch batch. Pad the names so the payload isn't trivial.
+    const ROWS: usize = 400;
+    let write_tx = setup
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Write)
+        .await
+        .unwrap();
+    let mut insert = String::from("insert\n");
+    for i in 0..ROWS {
+        insert.push_str(&format!(
+            "$w{i} isa widget, has name \"widget-{i:04}-{}\";\n",
+            "x".repeat(64)
+        ));
+    }
+    write_tx.query(&insert).await.unwrap();
+    write_tx.commit().await.unwrap();
+
+    let r = call(&client, "get_schema", with_sid(&sid, serde_json::json!({"database": db}))).await;
+    assert!(!is_error(&r), "get_schema should succeed: {r:?}");
+
+    let r = call(
+        &client,
+        "read_once",
+        with_sid(&sid, serde_json::json!({
+            "database": db,
+            "query": "match $w isa widget, has name $n; fetch { \"name\": $n };",
+        })),
+    )
+    .await;
+    assert!(
+        !is_error(&r),
+        "read_once must not abort mid-stream (TSV13 = tx closed before the \
+         answer stream was drained): {r:?}"
+    );
+    let env = envelope(&r);
+    let answers = env["result"]["answers"].as_array().expect("answers array");
+    assert_eq!(
+        answers.len(),
+        ROWS,
+        "read_once must return every row, not just the prefetched batch"
+    );
+
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+}
+
 // ---------- 4. Parse error preserves the transaction (recoverable) ----------
 
 #[tokio::test]
