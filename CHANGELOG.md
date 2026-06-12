@@ -18,6 +18,32 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-06-12
+
+### Fixed
+
+- `read_once` now drains the answer stream **before** closing its
+  managed transaction. The previous order (query → close → drain)
+  aborted on any result set larger than the driver's prefetch batch —
+  server-side `TSV13` under driver 3.11.1, client-side `CXN07` under
+  3.11.5 — which made `read_once` fail deterministically against real
+  databases while the one-row results in the test suite passed. Gated
+  regression test (`mcp_read_once_returns_full_multibatch_result`,
+  400 rows) pins the corrected order. `DESIGN.md` §5.0.1 now states
+  the drain-before-release rule.
+
+### Changed
+
+- `typedb-driver` bumped 3.11.1 → 3.11.5. TypeDB CE 3.11.5 standalone
+  servers report their replica without an advertised address, which
+  driver 3.11.1 filters out as unavailable and then fails the whole
+  connection with `CXN02`. Driver 3.11.5 falls back to the connection
+  address. Remains compatible with 3.11.1 servers.
+
+### Project / docs
+
+- `RELEASE.md` added, documenting the tag-driven GHCR release process.
+
 ## [0.1.2] — 2026-05-24
 
 ### Fixed
