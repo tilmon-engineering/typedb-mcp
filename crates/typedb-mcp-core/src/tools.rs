@@ -42,6 +42,10 @@ use crate::{
         NextMoves, envelope_err, envelope_ok, envelope_state_error, explain_query_error, next_moves,
     },
     error::{ErrorClass, InternalError},
+    language_reference::{
+        TYPEQL_LANGUAGE_REFERENCE, TYPEQL_LANGUAGE_REFERENCE_SHA256,
+        TYPEQL_LANGUAGE_REFERENCE_SOURCE,
+    },
     session::SessionStore,
     typedb::{TxKind, query_answer_to_json},
 };
@@ -83,9 +87,12 @@ Mint a new server-side session and return its `session_id`. Every other \
 tool in this server requires `session_id` as an argument — call this \
 first. The response also includes the list of databases on the server \
 (same content as `list_databases`) so you can pick one without a \
-follow-up call. Sessions expire after a configured period of inactivity \
-(default 60 minutes); on `SESSION_EXPIRED` or `SESSION_UNKNOWN` from any \
-other tool, call `start_session` again for a fresh ID.";
+follow-up call, plus a verbatim bundled TypeQL language reference. The \
+live database schema and this server's transaction lifecycle instructions \
+take precedence over the general reference. Sessions expire after a \
+configured period of inactivity (default 60 minutes); on `SESSION_EXPIRED` \
+or `SESSION_UNKNOWN` from any other tool, call `start_session` again for a \
+fresh ID.";
 
 const DESC_LIST_DATABASES: &str = "\
 List all databases available on the TypeDB server. Read-only; safe to call \
@@ -411,6 +418,12 @@ async fn do_start_session(core: &TypeDbCore) -> CallToolResult {
                 "session_id": sid.0,
                 "expires_in_seconds": expires_in_seconds,
                 "databases": names.iter().map(|n| serde_json::json!({"name": n})).collect::<Vec<_>>(),
+                "language_reference": {
+                    "content": TYPEQL_LANGUAGE_REFERENCE,
+                    "source": TYPEQL_LANGUAGE_REFERENCE_SOURCE,
+                    "sha256": TYPEQL_LANGUAGE_REFERENCE_SHA256,
+                    "precedence": "The live database schema and typedb-mcp lifecycle instructions take precedence over this general reference.",
+                },
             });
             envelope_ok(snap, result, next_moves::after_start_session())
         }

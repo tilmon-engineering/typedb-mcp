@@ -15,15 +15,20 @@
 use std::sync::Arc;
 
 use rmcp::{
-    ServerHandler,
-    handler::server::router::tool::ToolRouter,
-    model::{ServerCapabilities, ServerInfo},
-    tool_handler,
+    RoleServer, ServerHandler,
+    handler::server::router::{prompt::PromptRouter, tool::ToolRouter},
+    model::{
+        GetPromptRequestParams, GetPromptResult, ListPromptsResult, PaginatedRequestParams,
+        PromptMessage, PromptMessageRole, ServerCapabilities, ServerInfo,
+    },
+    prompt, prompt_handler, prompt_router, tool_handler,
+    service::RequestContext,
 };
 
 use crate::{
     config::Config,
     core::{HasTypeDbCore, TypeDbCore},
+    language_reference::TYPEQL_LANGUAGE_REFERENCE,
     session::SessionStore,
     tools::{RawToolsConfig, raw_tools_router},
     typedb::TypeDbClient,
@@ -33,6 +38,7 @@ use crate::{
 pub struct TypeDbMcp {
     pub core: Arc<TypeDbCore>,
     pub tool_router: ToolRouter<Self>,
+    pub prompt_router: PromptRouter<Self>,
 }
 
 impl TypeDbMcp {
@@ -51,7 +57,27 @@ impl TypeDbMcp {
     /// [`HasTypeDbCore`] on it directly.
     pub fn from_core(core: Arc<TypeDbCore>) -> Self {
         let tool_router = raw_tools_router::<Self>(RawToolsConfig::default());
-        Self { core, tool_router }
+        let prompt_router = Self::prompt_router();
+        Self {
+            core,
+            tool_router,
+            prompt_router,
+        }
+    }
+}
+
+#[prompt_router]
+impl TypeDbMcp {
+    /// Return the bundled TypeQL language reference verbatim.
+    #[prompt(
+        name = "typeql-language-reference",
+        description = "Return the bundled TypeQL language reference verbatim. The live database schema and typedb-mcp lifecycle instructions take precedence."
+    )]
+    async fn typeql_language_reference(&self) -> Vec<PromptMessage> {
+        vec![PromptMessage::new_text(
+            PromptMessageRole::User,
+            TYPEQL_LANGUAGE_REFERENCE,
+        )]
     }
 }
 
@@ -61,6 +87,7 @@ impl HasTypeDbCore for TypeDbMcp {
     }
 }
 
+#[prompt_handler(router = self.prompt_router)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for TypeDbMcp {
     fn get_info(&self) -> ServerInfo {
@@ -73,10 +100,17 @@ impl ServerHandler for TypeDbMcp {
              `error.retriable_in_same_tx` boolean indicating whether the \
              open transaction (if any) survived. On `SESSION_EXPIRED` or \
              `SESSION_UNKNOWN`, call `start_session` again. See DESIGN.md \
-             for the full state machine."
+             for the full state machine. `start_session` returns a verbatim \
+             bundled TypeQL language reference; prompt-capable clients can \
+             also request `typeql-language-reference`. The live schema and \
+             these lifecycle instructions take precedence over the general \
+             language reference."
                 .to_owned(),
         );
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_prompts()
+            .build();
         info
     }
 }

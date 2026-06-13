@@ -37,6 +37,12 @@ See [`DESIGN.md`](DESIGN.md) for the full contract.
   must call `get_schema` before opening a transaction, and every
   response carries `next_moves` telling it what calls are valid next.
   The state machine is small, but it is explicit.
+- **Bundled TypeQL language reference.** `start_session` returns the
+  verbatim reference with its upstream source and SHA-256. The reference
+  binary exposes the same content through the `typeql-language-reference`
+  MCP prompt for clients that support prompts. The live database schema
+  and typedb-mcp lifecycle instructions take precedence over the general
+  reference.
 - **Lifecycle-aware errors.** Every error tells the agent whether the
   open transaction is still alive (`error.retriable_in_same_tx`). The
   classification was probed empirically against TypeDB CE 3.10.4 (HTTP)

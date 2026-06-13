@@ -447,14 +447,16 @@ error:
 ```
 
 The `start_session` response is the one tool whose `result` block also
-carries the session_id explicitly (alongside `expires_in_seconds` and
-`databases`), since it's the canonical way the agent learns the ID it
-needs to thread through subsequent calls. Every other tool's response
-puts the ID in `session.session_id` only.
+carries the session_id explicitly (alongside `expires_in_seconds`,
+`databases`, and `language_reference`), since it's the canonical way the
+agent learns the ID it needs to thread through subsequent calls. The
+language reference is bundled and returned verbatim so tool-only agents
+receive it without relying on optional MCP prompt discovery. Every other
+tool's response puts the ID in `session.session_id` only.
 
 `next_moves` is intentionally not a single string — multiple valid next
 operations exist at most states, and the agent should see all of them.
-The catalogue lives in CLAUDE.md so it can evolve without re-versioning
+The catalogue lives in AGENTS.md so it can evolve without re-versioning
 this design document.
 
 ### 6.1 Envelope stability (library consumers)
@@ -520,7 +522,11 @@ invariant remain enforced.
 
 - **Params**: none
 - **Returns**: `{ session_id: string, expires_in_seconds: integer,
-  databases: [{name}, ...] }`. `expires_in_seconds` is the configured
+  databases: [{name}, ...], language_reference: {content, source, sha256,
+  precedence} }`. `language_reference.content` is the verbatim vendored
+  TypeQL reference. The live database schema and this server's lifecycle
+  instructions take precedence over its general guidance.
+  `expires_in_seconds` is the configured
   TTL (per-call resolution refreshes it); reporting it relative rather
   than as an absolute timestamp avoids any clock-skew confusion at the
   agent. The database list is returned for
@@ -541,6 +547,15 @@ invariant remain enforced.
   Sessions expire after a configured period of inactivity (default 60
   minutes); on `SESSION_EXPIRED` or `SESSION_UNKNOWN`, call this again
   for a fresh ID."
+
+### 7.0.1 `typeql-language-reference` MCP prompt
+
+The reference binary advertises one MCP prompt named
+`typeql-language-reference`. It returns the same verbatim bundled reference
+as `start_session.result.language_reference.content`. This is an optional
+discovery convenience for prompt-capable clients; correctness does not
+depend on clients supporting MCP prompts because `start_session` always
+returns the reference.
 
 ### 7.1 `list_databases`
 

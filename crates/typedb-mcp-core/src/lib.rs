@@ -21,6 +21,7 @@ pub mod envelope;
 pub mod error;
 pub mod extensions;
 pub mod handler;
+pub mod language_reference;
 pub mod session;
 pub mod tools;
 pub mod typedb;
@@ -33,6 +34,9 @@ pub use crate::envelope::{
 };
 pub use crate::error::{ErrorClass, InternalError, classify_driver_error, classify_typedb_error};
 pub use crate::extensions::Extensions;
+pub use crate::language_reference::{
+    TYPEQL_LANGUAGE_REFERENCE, TYPEQL_LANGUAGE_REFERENCE_SHA256, TYPEQL_LANGUAGE_REFERENCE_SOURCE,
+};
 pub use crate::session::{
     OpenTx, OpenTxView, SessionId, SessionResolveError, SessionSnapshot, SessionState,
     SessionStore, TxState, run_reaper,

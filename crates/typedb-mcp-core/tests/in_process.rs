@@ -15,11 +15,18 @@ use std::sync::Arc;
 
 use rmcp::{
     ClientHandler, ServiceExt,
-    model::{CallToolRequestParams, CallToolResult, ClientInfo},
+    model::{
+        CallToolRequestParams, CallToolResult, ClientInfo, GetPromptRequestParams,
+        PromptMessageContent,
+    },
 };
 use typedb_mcp_core::{
     config::{Config, Credentials, LoggingConfig, ServerConfig, TypeDbConfig},
     handler::TypeDbMcp,
+    language_reference::{
+        TYPEQL_LANGUAGE_REFERENCE, TYPEQL_LANGUAGE_REFERENCE_SHA256,
+        TYPEQL_LANGUAGE_REFERENCE_SOURCE,
+    },
     session::SessionStore,
     typedb::TypeDbClient,
 };
@@ -174,6 +181,28 @@ async fn mcp_list_databases_envelope() {
         "first next move mentions get_schema: {moves:?}"
     );
     assert!(env["result"]["databases"].is_array(), "databases list present");
+    assert_eq!(
+        env["result"]["language_reference"]["content"],
+        TYPEQL_LANGUAGE_REFERENCE
+    );
+    assert_eq!(
+        env["result"]["language_reference"]["source"],
+        TYPEQL_LANGUAGE_REFERENCE_SOURCE
+    );
+    assert_eq!(
+        env["result"]["language_reference"]["sha256"],
+        TYPEQL_LANGUAGE_REFERENCE_SHA256
+    );
+
+    let prompt = client
+        .get_prompt(GetPromptRequestParams::new("typeql-language-reference"))
+        .await
+        .expect("language reference prompt");
+    let prompt_text = match &prompt.messages.first().expect("prompt message").content {
+        PromptMessageContent::Text { text } => text,
+        other => panic!("expected text prompt, got {other:?}"),
+    };
+    assert_eq!(prompt_text, TYPEQL_LANGUAGE_REFERENCE);
 
     drop(client);
     let _ = server_handle.await;
