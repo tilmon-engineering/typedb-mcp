@@ -1,13 +1,15 @@
 # Build stage: compile the Rust binary with the toolchain image.
 FROM rust:1-bookworm AS builder
+ARG TARGETARCH
 WORKDIR /src
+ENV CARGO_TARGET_DIR=/src/target/${TARGETARCH}
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p typedb-mcp \
-    && cp target/release/typedb-mcp /typedb-mcp \
+    && cp "${CARGO_TARGET_DIR}/release/typedb-mcp" /typedb-mcp \
     && strip /typedb-mcp
 
 # Runtime stage: slim Debian with just the TLS roots the gRPC driver needs.
