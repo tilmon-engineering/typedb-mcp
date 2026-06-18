@@ -480,39 +480,53 @@ async fn mcp_list_databases_envelope() {
     let _ = server_handle.await;
 }
 
-// ---------- 2. schema gate blocks open_read until get_schema is called ----------
+// ---------- 2. schema gate blocks transactions/read_once until get_schema ----------
 
 #[tokio::test]
-async fn mcp_schema_gate_blocks_open_without_get_schema() {
+async fn mcp_schema_gate_blocks_all_open_paths_without_get_schema() {
     if !enabled() {
         return;
     }
     let (server_handle, client, _sessions) = connected_pair().await;
-    let sid = mint_sid(&client).await;
 
-    let result = call(
-        &client,
-        "open_read",
-        with_sid(
-            &sid,
+    for (tool, args) in [
+        (
+            "open_read",
             serde_json::json!({"database": "nonexistent_for_gate_test"}),
         ),
-    )
-    .await;
-    assert!(
-        is_error(&result),
-        "open without get_schema should be an error"
-    );
-    let env = envelope(&result);
-    assert_eq!(env["error"]["class"], "SCHEMA_NOT_READ");
-    assert_eq!(env["error"]["retriable_in_same_tx"], false);
-    let moves = env["next_moves"].as_array().expect("array");
-    assert!(
-        moves
-            .iter()
-            .any(|m| m.as_str().unwrap().contains("get_schema")),
-        "next_moves directs to get_schema: {moves:?}"
-    );
+        (
+            "open_write",
+            serde_json::json!({"database": "nonexistent_for_gate_test"}),
+        ),
+        (
+            "open_schema",
+            serde_json::json!({"database": "nonexistent_for_gate_test"}),
+        ),
+        (
+            "read_once",
+            serde_json::json!({
+                "database": "nonexistent_for_gate_test",
+                "query": "match $x isa thing; fetch { \"x\": $x };"
+            }),
+        ),
+    ] {
+        let sid = mint_sid(&client).await;
+        let result = call(&client, tool, with_sid(&sid, args)).await;
+        assert!(
+            is_error(&result),
+            "{tool} without get_schema should be an error: {result:?}"
+        );
+        let env = envelope(&result);
+        assert_eq!(env["error"]["class"], "SCHEMA_NOT_READ", "tool={tool}");
+        assert_eq!(env["error"]["retriable_in_same_tx"], false, "tool={tool}");
+        let moves = env["next_moves"].as_array().expect("array");
+        assert!(
+            moves
+                .iter()
+                .any(|m| m.as_str().unwrap().contains("get_schema")),
+            "next_moves directs to get_schema for {tool}: {moves:?}"
+        );
+    }
 
     drop(client);
     let _ = server_handle.await;
@@ -632,6 +646,102 @@ async fn mcp_full_write_lifecycle() {
     // Cleanup
     setup.delete_database(&db).await.unwrap();
 
+    drop(client);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn mcp_schema_commit_clears_schema_gate_for_database() {
+    if !enabled() {
+        return;
+    }
+    let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!(
+        "mcp_schema_clear_{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    setup.create_database(&db).await.unwrap();
+
+    let r = call(
+        &client,
+        "get_schema",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "get_schema should succeed: {r:?}");
+    let r = call(
+        &client,
+        "open_schema",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "open_schema should succeed: {r:?}");
+    let r = call(
+        &client,
+        "query",
+        with_sid(
+            &sid,
+            serde_json::json!({
+                "query": "define attribute name, value string; entity widget, owns name @card(1..1);"
+            }),
+        ),
+    )
+    .await;
+    assert!(!is_error(&r), "schema define should succeed: {r:?}");
+    let r = call(&client, "commit", with_sid(&sid, serde_json::Value::Null)).await;
+    assert!(!is_error(&r), "schema commit should succeed: {r:?}");
+    let env = envelope(&r);
+    assert_eq!(env["result"]["committed"], true);
+    assert!(
+        !env["session"]["schema_seen_for"]
+            .as_array()
+            .expect("schema_seen_for array")
+            .iter()
+            .any(|seen| seen.as_str() == Some(&db)),
+        "schema commit should clear schema_seen for changed database"
+    );
+
+    let r = call(
+        &client,
+        "open_write",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(
+        is_error(&r),
+        "open_write after schema commit without re-reading schema should fail: {r:?}"
+    );
+    let env = envelope(&r);
+    assert_eq!(env["error"]["class"], "SCHEMA_NOT_READ");
+
+    let r = call(
+        &client,
+        "get_schema",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(
+        !is_error(&r),
+        "get_schema after schema commit should succeed: {r:?}"
+    );
+    let r = call(
+        &client,
+        "open_write",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(
+        !is_error(&r),
+        "open_write should succeed after re-reading schema: {r:?}"
+    );
+    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+
+    setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;
 }
@@ -905,6 +1015,88 @@ async fn mcp_read_once_does_not_emit_tsv3() {
     );
 }
 
+#[tokio::test]
+async fn mcp_expired_read_tx_session_does_not_emit_tsv3() {
+    if !enabled() {
+        return;
+    }
+
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer = CaptureWriter(captured.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(writer)
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut config = test_config();
+    config.server.session_ttl_s = 3;
+    let (server_handle, client, _sessions) = connected_pair_with_config(config).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!(
+        "mcp_expired_read_{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    setup.create_database(&db).await.unwrap();
+    let schema_tx = setup
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
+        .await
+        .unwrap();
+    schema_tx
+        .query("define attribute name, value string; entity widget, owns name @card(1..1);")
+        .await
+        .unwrap();
+    schema_tx.commit().await.unwrap();
+
+    let sid = mint_sid(&client).await;
+    let r = call(
+        &client,
+        "get_schema",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "get_schema should succeed: {r:?}");
+    let r = call(
+        &client,
+        "open_read",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "open_read should succeed: {r:?}");
+
+    // Let the server-issued session TTL pass, then call any session-bound tool.
+    // resolve_and_touch will purge the expired session and release its open
+    // READ tx. That release must go through close(), not rollback().
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let r = call(
+        &client,
+        "list_databases",
+        with_sid(&sid, serde_json::Value::Null),
+    )
+    .await;
+    assert!(is_error(&r), "expired session should error: {r:?}");
+    let env = envelope(&r);
+    assert_eq!(env["error"]["class"], "SESSION_EXPIRED");
+
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+
+    let logs = String::from_utf8(captured.lock().unwrap().clone()).expect("captured logs are utf8");
+    assert!(
+        !logs.contains("TSV3"),
+        "expired read tx cleanup emitted TSV3 — read tx is being released via rollback() instead of close(). Captured logs:\n{logs}"
+    );
+    assert!(
+        !logs.contains("rollback on expired session failed"),
+        "expired session cleanup used the old rollback path. Captured logs:\n{logs}"
+    );
+}
+
 // ---------- 3e. read_once must drain the answer stream before close ----------
 //
 // Regression: do_read_once used to call `tx.close()` between `tx.query()`
@@ -994,6 +1186,98 @@ async fn mcp_read_once_returns_full_multibatch_result() {
         "read_once must return every row, not just the prefetched batch"
     );
 
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn mcp_query_result_cap_keeps_read_tx_usable() {
+    if !enabled() {
+        return;
+    }
+    let mut config = test_config();
+    config.server.result_cap = 3;
+    let (server_handle, client, _sessions) = connected_pair_with_config(config).await;
+    let sid = mint_sid(&client).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!("mcp_query_cap_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    setup.create_database(&db).await.unwrap();
+    let schema_tx = setup
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
+        .await
+        .unwrap();
+    schema_tx
+        .query("define attribute name, value string; entity widget, owns name @card(1..1);")
+        .await
+        .unwrap();
+    schema_tx.commit().await.unwrap();
+
+    let write_tx = setup
+        .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Write)
+        .await
+        .unwrap();
+    let mut insert = String::from("insert\n");
+    for i in 0..10 {
+        insert.push_str(&format!("$w{i} isa widget, has name \"widget-{i:04}\";\n"));
+    }
+    write_tx.query(&insert).await.unwrap();
+    write_tx.commit().await.unwrap();
+
+    let r = call(
+        &client,
+        "get_schema",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "get_schema should succeed: {r:?}");
+    let r = call(
+        &client,
+        "open_read",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "open_read should succeed: {r:?}");
+
+    let r = call(
+        &client,
+        "query",
+        with_sid(
+            &sid,
+            serde_json::json!({
+                "query": "match $w isa widget, has name $n; fetch { \"name\": $n };"
+            }),
+        ),
+    )
+    .await;
+    assert!(is_error(&r), "over-cap query should error: {r:?}");
+    let env = envelope(&r);
+    assert_eq!(env["error"]["class"], "RESULT_LIMIT_EXCEEDED");
+    assert_eq!(
+        env["session"]["transaction"]["state"], "open",
+        "RESULT_LIMIT_EXCEEDED should leave the read tx open"
+    );
+
+    let r = call(
+        &client,
+        "query",
+        with_sid(
+            &sid,
+            serde_json::json!({
+                "query": "match $w isa widget, has name $n; $n == \"widget-0000\"; fetch { \"name\": $n };"
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        !is_error(&r),
+        "read tx should remain usable after RESULT_LIMIT_EXCEEDED: {r:?}"
+    );
+
+    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
     setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;

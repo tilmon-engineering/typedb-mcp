@@ -149,7 +149,7 @@ impl SessionStore {
             return Err(SessionResolveError::Unknown);
         };
         // Check expiry without holding the inner-store lock during the
-        // tx rollback (which can take some time).
+        // tx release (which can take some time).
         let now = Instant::now();
         let expired = {
             let state = arc.lock().await;
@@ -157,17 +157,21 @@ impl SessionStore {
         };
         if expired {
             // Purge and report. Hold the store lock through the remove,
-            // then release before rolling back any open tx.
+            // then release any open tx after dropping it.
             guard.remove(id);
             drop(guard);
-            // Best-effort: roll back any tx the dying session held.
+            // Best-effort: release any tx the dying session held. This must
+            // use OpenTx::release() (close for READ, rollback for WRITE/SCHEMA)
+            // rather than unconditional rollback; TypeDB rejects rollback on
+            // READ txs with TSV3. See DESIGN.md §5.0.1.
             if let Some(tx) = arc.lock().await.tx.take() {
-                if let Err(e) = tx.transaction.rollback().await {
+                if let Err(e) = tx.release().await {
                     tracing::warn!(
                         target: "typedb_mcp::session",
                         session_id = %id.0,
+                        kind = ?tx.kind,
                         error = %e,
-                        "rollback on expired session failed",
+                        "release on expired session failed",
                     );
                 }
             }
