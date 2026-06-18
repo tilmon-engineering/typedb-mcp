@@ -6,7 +6,7 @@ ENV CARGO_TARGET_DIR=/src/target/${TARGETARCH}
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target \
     cargo build --release --locked -p typedb-mcp \
     && cp "${CARGO_TARGET_DIR}/release/typedb-mcp" /typedb-mcp \
