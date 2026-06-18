@@ -17,6 +17,26 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-18
+
+### Added
+
+- GHCR images are now built and published as multi-arch manifests for
+  `linux/amd64` and `linux/arm64`, making the container image directly usable
+  on Apple Silicon Docker Desktop and ARM64 Linux hosts.
+
+### Fixed
+
+- Docker multi-arch builds now keep per-architecture Cargo target directories
+  and lock the shared Cargo registry cache, avoiding concurrent unpack races
+  between the amd64 and arm64 Buildx workers.
+
+### Docs
+
+- `RELEASE.md` now defines the project's major/minor/patch bump rules and
+  requires `main` to prove every intended image platform before cutting a
+  version tag.
+
 ## [0.1.4] — 2026-06-18
 
 ### Added

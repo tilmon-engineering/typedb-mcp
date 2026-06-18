@@ -28,12 +28,28 @@ pre-release responsibility (see step 1).
 
 - Single source of truth: `[workspace.package] version` in the root
   `Cargo.toml`. All three crates inherit it via `version.workspace = true`.
-- SemVer, with the contract surface defined in `CHANGELOG.md`'s scope
-  notes: the ten agent-facing tools (`DESIGN.md` §7), the response
-  envelope, the transaction state machine, and the `typedb-mcp-core`
-  public re-exports (`DESIGN.md` §11). Breaking any of those is at
-  minimum a minor bump pre-1.0 (and a `DESIGN.md` change first — see
-  `CLAUDE.md` Boundaries). Fixes and compatible additions are a patch.
+- This project uses SemVer for the container image and the in-repo Rust
+  packages. The contract surface is defined in `CHANGELOG.md`'s scope notes:
+  the ten default agent-facing tools (`DESIGN.md` §7), any explicitly enabled
+  built-in tool surfaces, the response envelope, the transaction state machine,
+  deployment/runtime compatibility promises, and the `typedb-mcp-core` public
+  re-exports (`DESIGN.md` §11).
+- **Major** (`X.0.0`): use for breaking changes once the project reaches
+  `1.0.0`, or for pre-1.0 resets that intentionally signal a new compatibility
+  era. Breaking the agent-facing tool contract, envelope shape, transaction
+  lifecycle, supported TypeDB major/minimum version, image/runtime contract, or
+  public library API requires a `DESIGN.md` update first.
+- **Minor** (`0.Y.0` before 1.0, `X.Y.0` after 1.0): use for compatible new
+  capabilities, new optional tools, new public library APIs, new supported
+  deployment platforms/architectures, or any pre-1.0 breaking contract change.
+  Pre-1.0 breaking changes are minor bumps rather than major bumps, but must be
+  called out clearly in `CHANGELOG.md`.
+- **Patch** (`X.Y.Z`): use for bug fixes, security fixes, dependency updates,
+  test/docs/build-process corrections, and compatible behavior fixes that do
+  not add a new contract capability or remove/reshape an existing one.
+- When in doubt, choose the larger bump and explain why in `CHANGELOG.md`. Never
+  cut a version tag until `main` has already built successfully for every
+  platform that release is meant to publish.
 
 ## Cutting a release
 
