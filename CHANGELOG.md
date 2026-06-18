@@ -27,9 +27,9 @@ Scope notes:
 
 ### Fixed
 
-- Docker multi-arch builds now keep per-architecture Cargo target directories
-  and lock the shared Cargo registry cache, avoiding concurrent unpack races
-  between the amd64 and arm64 Buildx workers.
+- Docker multi-arch builds now use per-architecture Cargo target,
+  registry, and git caches, avoiding concurrent unpack races and cache
+  contention between the amd64 and arm64 Buildx workers.
 
 ### Docs
 
