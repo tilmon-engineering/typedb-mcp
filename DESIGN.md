@@ -45,17 +45,18 @@ agent-facing state machine.
 
 ### Hybrid library + application
 
-typedb-mcp ships in two shapes: a **server binary** with the ten tools
-enumerated in §7, and a **library crate** that exposes the same
-connection, session, transaction, and envelope machinery for other MCP
-servers to embed. A consuming server may mount the ten raw tools
-verbatim, prefix them, omit some, or add semantic tools of its own —
-but any TypeDB-backed tool it adds **must** go through the library's
-transaction helpers, so the safety thesis (this section), the
-schema-read gate (§3.5), the single-tx invariant (§3.4), the
-schema-commit clear rule (§3.6), and the response envelope (§6) hold
-uniformly across raw and semantic tools. The library API is described
-in §11; it is the authoritative integration surface.
+typedb-mcp ships in two shapes: a **server binary** with the ten default
+tools enumerated in §7 (plus optional database-admin tools only when the
+operator explicitly enables them), and a **library crate** that exposes
+the same connection, session, transaction, and envelope machinery for
+other MCP servers to embed. A consuming server may mount the ten raw
+tools verbatim, prefix them, omit some, opt into the database-admin tools,
+or add semantic tools of its own — but any TypeDB-backed tool it adds
+**must** go through the library's transaction helpers, so the safety
+thesis (this section), the schema-read gate (§3.5), the single-tx
+invariant (§3.4), the schema-commit clear rule (§3.6), and the response
+envelope (§6) hold uniformly across raw and semantic tools. The library
+API is described in §11; it is the authoritative integration surface.
 
 ---
 
@@ -300,7 +301,8 @@ Mapping into agent-facing error classes:
 | MCP error class           | When                                              | Tx after  |
 | ------------------------- | ------------------------------------------------- | --------- |
 | `SCHEMA_NOT_READ`         | `open_*` / `read_once` without prior `get_schema` | unchanged |
-| `TX_ALREADY_OPEN`         | second `open_*` while one is held                 | unchanged |
+| `TX_ALREADY_OPEN`         | second `open_*` while one is held, or admin op while a tx is open | unchanged |
+| `CONFIRMATION_REQUIRED`   | destructive admin op missing exact confirmation   | none      |
 | `NO_TX_OPEN`              | `query` / `commit` with no tx                     | none      |
 | `TX_IS_READ`              | `commit` on a read tx (`TSV2`)                    | unchanged |
 | `WRONG_TX_TYPE`           | data query on read tx, schema query on write tx   | **open**  |
@@ -505,18 +507,23 @@ Notes:
 
 ## 7. Tool surface
 
-Ten tools. The first, `start_session`, mints the `session_id` that every
-other tool requires (see §3). All non-`start_session` tools take
-`session_id: string` as a required argument and return `SESSION_UNKNOWN`
-or `SESSION_EXPIRED` if it does not resolve.
+Ten tools are mounted by default. The first, `start_session`, mints the
+`session_id` that every other default tool requires (see §3). All
+non-`start_session` tools take `session_id: string` as a required
+argument and return `SESSION_UNKNOWN` or `SESSION_EXPIRED` if it does not
+resolve.
 
-The ten tools enumerated here are the defaults the **binary** mounts.
-Library consumers (§11) may prefix raw tool names, omit individual
-tools, or expose only a subset — subject to the safety thesis (§1): no
-consumer-added tool may compose into a `write_once` / `schema_once`
-shape, and any tool that opens a transaction must do so through the
-kernel's `with_*_tx` helpers so the schema-read gate and single-tx
-invariant remain enforced.
+The ten tools enumerated in §7.0-§7.9 are the defaults the **binary**
+mounts. Two additional database-admin tools (§7.10-§7.11) exist but are
+absent unless the operator explicitly sets
+`server.enable_database_admin_tools = true`; default deployments therefore
+still advertise exactly `tools::names::ALL`. Library consumers (§11) may
+prefix raw tool names, omit individual tools, expose only a subset, or opt
+into the gated admin tools — subject to the safety thesis (§1): no
+consumer-added tool may compose into a `write_once` / `schema_once` shape,
+and any tool that opens a transaction must do so through the kernel's
+`with_*_tx` helpers so the schema-read gate and single-tx invariant remain
+enforced.
 
 ### 7.0 `start_session`
 
@@ -660,6 +667,44 @@ returns the reference.
   that the agent must look at the data before committing a write. A one-shot
   write would undo that.
 
+### 7.10 `create_database` (optional admin tool)
+
+- **Availability**: absent by default. Mounted only when the operator sets
+  `server.enable_database_admin_tools = true`.
+- **Params**: `session_id: string`, `database: string`
+- **Returns**: `{ created: true, database: string }` + session block
+- **Annotation**: admin, state-changing
+- **Gate**: valid session AND no transaction open in this session. Database
+  names are prevalidated conservatively before reaching TypeDB.
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `TX_ALREADY_OPEN`,
+  `UPSTREAM_UNAVAILABLE`, `UNCLASSIFIED` for local name-validation failure
+  or an unrecognized TypeDB error.
+- **Description (agent-facing)**: must state that this tool is disabled unless
+  explicitly enabled by operator config, creates a database on the TypeDB
+  server, requires a valid `session_id`, and fails if this session has an
+  open transaction.
+
+### 7.11 `delete_database` (optional destructive admin tool)
+
+- **Availability**: absent by default. Mounted only when the operator sets
+  `server.enable_database_admin_tools = true`.
+- **Params**: `session_id: string`, `database: string`,
+  `confirm_database: string`
+- **Returns**: `{ deleted: true, database: string }` + session block
+- **Annotation**: **destructive admin** — permanently deletes schema and data.
+- **Gate**: valid session, `confirm_database == database`, no transaction open
+  in this session, and no live server session has an open transaction on the
+  target database. On success, schema-read gates for the deleted database are
+  cleared from all live sessions.
+- **Errors**: `SESSION_UNKNOWN`, `SESSION_EXPIRED`, `CONFIRMATION_REQUIRED`,
+  `TX_ALREADY_OPEN`, `UNKNOWN_DATABASE`, `UPSTREAM_UNAVAILABLE`,
+  `UNCLASSIFIED` for local name-validation failure or an unrecognized TypeDB
+  error.
+- **Description (agent-facing)**: must use explicit destructive language:
+  permanently deletes schema and data, is disabled by default, requires the
+  confirmation field, and rejects while transactions are open on the target
+  database.
+
 ---
 
 ## 8. Result cap and pagination guidance
@@ -705,6 +750,9 @@ session_ttl_s         = 3600   # session-level: TTL on the SessionStore entry, r
 result_cap            = 500
 listen_stdio          = true
 listen_http           = "127.0.0.1:8765"     # null to disable
+# Disabled by default. When true, exposes destructive database-admin tools:
+# create_database and delete_database. Enable only for trusted/scratch deployments.
+enable_database_admin_tools = false
 
 [typedb]
 address     = "127.0.0.1:1729"                  # gRPC host:port; no scheme
@@ -763,10 +811,11 @@ Three layers, named for the role they play:
    the per-session `Arc<Mutex<SessionState>>`. All transaction work and
    envelope emission happens through methods on this handle so the
    per-session lock is acquired with the right window every time.
-3. **The raw tool set** — `RawToolSet`. A builder over the ten tools
-   in §7 that consumers can mount into their `ServerHandler`, with
-   knobs for prefixing names, omitting individual tools, and (for the
-   binary) being mounted whole.
+3. **The raw tool router** — `tools::raw_tools_router::<H>`. A generic
+   router over the ten default tools in §7.0-§7.9 that consumers can mount
+   into their `ServerHandler`, with knobs for prefixing names, omitting
+   individual tools, and opting into the separately gated database-admin
+   tools (§7.10-§7.11).
 
 ### 11.2 What a consumer's semantic tool body looks like
 
@@ -890,20 +939,27 @@ pub enum TxOutcome<T> {
 The binary's wiring (in `src/main.rs`) becomes one of:
 
 ```rust
-// All ten tools, default names.
-let raw = RawToolSet::all(core.clone()).into_router();
+// All ten default tools, default names.
+let raw = tools::raw_tools_router::<MyHandler>(RawToolsConfig::default());
 
 // Or selectively:
-let raw = RawToolSet::all(core.clone())
-    .with_prefix("tdb_")
-    .without(["read_once"])   // consumer is shadowing it
-    .into_router();
+let raw = tools::raw_tools_router::<MyHandler>(
+    RawToolsConfig::default()
+        .with_prefix("tdb_")
+        .without(["read_once"])   // consumer is shadowing it
+);
+
+// Optional admin tools are separately gated and not part of names::ALL.
+let raw_with_admin = tools::raw_tools_router::<MyHandler>(
+    RawToolsConfig::default().with_database_admin_tools(true)
+);
 ```
 
 The router returned has a `Self` type that depends on the composition
 strategy (see §11.5). The binary's existing `TypeDbMcp` handler stays
-as a thin wrapper around `RawToolSet` so the binary's behaviour does
-not change.
+as a thin wrapper around `raw_tools_router::<TypeDbMcp>` so default binary
+behaviour remains the ten-tool surface unless the operator enables the
+admin flag.
 
 ### 11.5 Composing raw tools into a consumer's handler
 

@@ -34,7 +34,10 @@ async fn fresh_client_and_db(prefix: &str) -> (TypeDbClient, String) {
 }
 
 async fn define_basic_schema(client: &TypeDbClient, db: &str) {
-    let tx = client.open_transaction(db, TxKind::Schema).await.expect("open schema tx");
+    let tx = client
+        .open_transaction(db, TxKind::Schema)
+        .await
+        .expect("open schema tx");
     let _ = tx
         .query(
             "define
@@ -52,22 +55,36 @@ async fn define_basic_schema(client: &TypeDbClient, db: &str) {
 
 #[tokio::test]
 async fn write_commit_read_cycle() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_write").await;
     define_basic_schema(&client, &db).await;
 
     // write
     let tx = client.open_transaction(&db, TxKind::Write).await.unwrap();
-    tx.query("insert $p isa person, has name \"Alice\";").await.expect("insert ok");
+    tx.query("insert $p isa person, has name \"Alice\";")
+        .await
+        .expect("insert ok");
     tx.commit().await.expect("commit ok");
 
     // read back
     let tx = client.open_transaction(&db, TxKind::Read).await.unwrap();
-    let answer = tx.query("match $p isa person, has name $n; fetch { \"name\": $n };").await.expect("read ok");
-    let json = query_answer_to_json(answer, 500).await.expect("materialize");
+    let answer = tx
+        .query("match $p isa person, has name $n; fetch { \"name\": $n };")
+        .await
+        .expect("read ok");
+    let json = query_answer_to_json(answer, 500)
+        .await
+        .expect("materialize");
     let v = json.into_value();
     eprintln!("read-back: {v}");
-    assert!(v.get("answers").and_then(|a| a.as_array()).map(|a| !a.is_empty()).unwrap_or(false));
+    assert!(
+        v.get("answers")
+            .and_then(|a| a.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    );
     let _ = tx.rollback().await;
 
     client.delete_database(&db).await.expect("cleanup");
@@ -77,7 +94,9 @@ async fn write_commit_read_cycle() {
 
 #[tokio::test]
 async fn parse_error_leaves_tx_open() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_parse").await;
     define_basic_schema(&client, &db).await;
 
@@ -87,7 +106,10 @@ async fn parse_error_leaves_tx_open() {
     let class = typedb_mcp_core::error::classify_driver_error(&bad_err);
     eprintln!("parse-error class: {class:?}");
     assert_eq!(class, ErrorClass::ParseError);
-    assert!(class.retriable_in_same_tx(), "DESIGN.md §5 says parse errors survive");
+    assert!(
+        class.retriable_in_same_tx(),
+        "DESIGN.md §5 says parse errors survive"
+    );
 
     // Tx still usable.
     tx.query("insert $p isa person, has name \"Bob\";")
@@ -102,19 +124,25 @@ async fn parse_error_leaves_tx_open() {
 
 #[tokio::test]
 async fn type_error_leaves_tx_open() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_type").await;
     define_basic_schema(&client, &db).await;
 
     let tx = client.open_transaction(&db, TxKind::Write).await.unwrap();
-    let bad = tx.query("match $x isa nonexistent_type; fetch { $x.* };").await;
+    let bad = tx
+        .query("match $x isa nonexistent_type; fetch { $x.* };")
+        .await;
     let class = typedb_mcp_core::error::classify_driver_error(&bad.expect_err("type err"));
     eprintln!("type-error class: {class:?}");
     assert_eq!(class, ErrorClass::TypeError);
     assert!(class.retriable_in_same_tx());
 
     // Tx still usable.
-    tx.query("insert $p isa person, has name \"Eve\";").await.expect("post-type-err insert");
+    tx.query("insert $p isa person, has name \"Eve\";")
+        .await
+        .expect("post-type-err insert");
     tx.commit().await.expect("commit");
 
     client.delete_database(&db).await.expect("cleanup");
@@ -124,7 +152,9 @@ async fn type_error_leaves_tx_open() {
 
 #[tokio::test]
 async fn write_pipeline_error_aborts_tx() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_write_fail").await;
     define_basic_schema(&client, &db).await;
 
@@ -135,7 +165,10 @@ async fn write_pipeline_error_aborts_tx() {
     let class = typedb_mcp_core::error::classify_driver_error(&bad.expect_err("regex violation"));
     eprintln!("write-fail class: {class:?}");
     assert_eq!(class, ErrorClass::WriteFailed);
-    assert!(!class.retriable_in_same_tx(), "DESIGN.md §5 says write-pipeline errors are fatal");
+    assert!(
+        !class.retriable_in_same_tx(),
+        "DESIGN.md §5 says write-pipeline errors are fatal"
+    );
 
     // Tx should be dead. What does the driver actually report?
     let follow = tx.query("insert $p isa person, has name \"Carol\";").await;
@@ -172,7 +205,9 @@ async fn write_pipeline_error_aborts_tx() {
 // having one.
 #[tokio::test]
 async fn write_pipeline_abort_discards_prior_writes() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_write_discard").await;
     define_basic_schema(&client, &db).await;
 
@@ -192,7 +227,9 @@ async fn write_pipeline_abort_discards_prior_writes() {
         .query("match $p isa person, has name \"Dora\"; fetch { \"name\": $p.name };")
         .await
         .expect("read ok");
-    let json = query_answer_to_json(answer, 500).await.expect("materialize");
+    let json = query_answer_to_json(answer, 500)
+        .await
+        .expect("materialize");
     let v = json.into_value();
     let empty = v
         .get("answers")
@@ -212,13 +249,17 @@ async fn write_pipeline_abort_discards_prior_writes() {
 
 #[tokio::test]
 async fn commit_time_cardinality_fails_at_commit() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_commit_fail").await;
     define_basic_schema(&client, &db).await;
 
     let tx = client.open_transaction(&db, TxKind::Write).await.unwrap();
     // Insert a person *without* name — violates @card(1..1), but only at commit.
-    tx.query("insert $p isa person, has age 30;").await.expect("insert accepted");
+    tx.query("insert $p isa person, has age 30;")
+        .await
+        .expect("insert accepted");
     let commit_err = tx.commit().await.expect_err("commit must fail");
     let class = typedb_mcp_core::error::classify_driver_error(&commit_err);
     eprintln!("commit-fail class: {class:?}");
@@ -231,7 +272,9 @@ async fn commit_time_cardinality_fails_at_commit() {
 
 #[tokio::test]
 async fn wrong_tx_type_is_recoverable() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_wrong_tx").await;
     define_basic_schema(&client, &db).await;
 
@@ -254,13 +297,17 @@ async fn wrong_tx_type_is_recoverable() {
 
 #[tokio::test]
 async fn concept_row_emits_structured_json() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_row").await;
     define_basic_schema(&client, &db).await;
 
     // Insert with mixed concept kinds in the projection.
     let tx = client.open_transaction(&db, TxKind::Write).await.unwrap();
-    tx.query("insert $p isa person, has name \"Alice\", has age 33;").await.expect("insert");
+    tx.query("insert $p isa person, has name \"Alice\", has age 33;")
+        .await
+        .expect("insert");
     tx.commit().await.expect("commit");
 
     // `match ... ;` (no `fetch`) returns a ConceptRowStream — that's the path
@@ -270,7 +317,9 @@ async fn concept_row_emits_structured_json() {
         .query("match $p isa person, has name $n, has age $a;")
         .await
         .expect("row query");
-    let json = query_answer_to_json(answer, 500).await.expect("materialize");
+    let json = query_answer_to_json(answer, 500)
+        .await
+        .expect("materialize");
     let _ = tx.rollback().await;
     let answer_type = json.answer_type.clone();
     let answers = json.answers.clone();
@@ -280,26 +329,53 @@ async fn concept_row_emits_structured_json() {
     );
     assert_eq!(answer_type, "conceptRows");
     let answers = answers.as_array().expect("array");
-    let row = answers.first().expect("one row").as_object().expect("object row");
+    let row = answers
+        .first()
+        .expect("one row")
+        .as_object()
+        .expect("object row");
 
     // Person concept — should be an Entity with a type label.
-    let person = row.get("p").expect("p column").as_object().expect("p is object");
+    let person = row
+        .get("p")
+        .expect("p column")
+        .as_object()
+        .expect("p is object");
     assert_eq!(person.get("kind").and_then(|v| v.as_str()), Some("entity"));
     assert_eq!(person.get("type").and_then(|v| v.as_str()), Some("person"));
-    assert!(person.get("iid").and_then(|v| v.as_str()).is_some_and(|s| s.starts_with("0x")));
+    assert!(
+        person
+            .get("iid")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s.starts_with("0x"))
+    );
 
     // Name attribute — string value rendered as JSON string.
-    let name = row.get("n").expect("n column").as_object().expect("n is object");
+    let name = row
+        .get("n")
+        .expect("n column")
+        .as_object()
+        .expect("n is object");
     assert_eq!(name.get("kind").and_then(|v| v.as_str()), Some("attribute"));
     assert_eq!(name.get("type").and_then(|v| v.as_str()), Some("name"));
-    assert_eq!(name.get("valueType").and_then(|v| v.as_str()), Some("string"));
+    assert_eq!(
+        name.get("valueType").and_then(|v| v.as_str()),
+        Some("string")
+    );
     assert_eq!(name.get("value").and_then(|v| v.as_str()), Some("Alice"));
 
     // Age attribute — integer value rendered as JSON number.
-    let age = row.get("a").expect("a column").as_object().expect("a is object");
+    let age = row
+        .get("a")
+        .expect("a column")
+        .as_object()
+        .expect("a is object");
     assert_eq!(age.get("kind").and_then(|v| v.as_str()), Some("attribute"));
     assert_eq!(age.get("type").and_then(|v| v.as_str()), Some("age"));
-    assert_eq!(age.get("valueType").and_then(|v| v.as_str()), Some("integer"));
+    assert_eq!(
+        age.get("valueType").and_then(|v| v.as_str()),
+        Some("integer")
+    );
     assert_eq!(age.get("value").and_then(|v| v.as_i64()), Some(33));
 
     client.delete_database(&db).await.expect("cleanup");
@@ -309,7 +385,9 @@ async fn concept_row_emits_structured_json() {
 
 #[tokio::test]
 async fn result_cap_truncates_and_signals() {
-    if !enabled() { return; }
+    if !enabled() {
+        return;
+    }
     let (client, db) = fresh_client_and_db("smoke_cap").await;
 
     // Lightweight schema: just an entity with name.
@@ -318,7 +396,9 @@ async fn result_cap_truncates_and_signals() {
         "define
            attribute name, value string;
            entity widget, owns name @card(1..1);",
-    ).await.expect("define");
+    )
+    .await
+    .expect("define");
     tx.commit().await.expect("commit schema");
 
     // Insert 10 widgets.
@@ -332,11 +412,22 @@ async fn result_cap_truncates_and_signals() {
 
     // Query with cap = 3.
     let tx = client.open_transaction(&db, TxKind::Read).await.unwrap();
-    let answer = tx.query("match $w isa widget, has name $n; fetch { \"name\": $n };").await.expect("read");
+    let answer = tx
+        .query("match $w isa widget, has name $n; fetch { \"name\": $n };")
+        .await
+        .expect("read");
     let json = query_answer_to_json(answer, 3).await.expect("materialize");
-    eprintln!("truncated={} answers_len={}", json.truncated, json.answers.as_array().map(|a| a.len()).unwrap_or(0));
+    eprintln!(
+        "truncated={} answers_len={}",
+        json.truncated,
+        json.answers.as_array().map(|a| a.len()).unwrap_or(0)
+    );
     assert!(json.truncated, "10 widgets > cap of 3 should truncate");
-    assert_eq!(json.answers.as_array().map(|a| a.len()).unwrap_or(0), 3, "exactly cap rows");
+    assert_eq!(
+        json.answers.as_array().map(|a| a.len()).unwrap_or(0),
+        3,
+        "exactly cap rows"
+    );
     let _ = tx.rollback().await;
 
     client.delete_database(&db).await.expect("cleanup");

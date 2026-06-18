@@ -5,7 +5,6 @@ use std::{path::Path, time::Duration};
 
 use crate::typedb::TxKind;
 
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -43,6 +42,11 @@ pub struct ServerConfig {
     /// `host:port` to bind the Streamable HTTP transport, or `None` to disable.
     #[serde(default)]
     pub listen_http: Option<String>,
+    /// Expose destructive database-admin tools (`create_database` and
+    /// `delete_database`). Disabled by default; enable only for trusted or
+    /// scratch deployments.
+    #[serde(default)]
+    pub enable_database_admin_tools: bool,
     /// Host-header allowlist for the Streamable HTTP transport. Defaults to
     /// `["localhost", "127.0.0.1", "::1"]` (rmcp's loopback-only default,
     /// which mitigates DNS rebinding against local stdio-style deployments).
@@ -74,10 +78,7 @@ pub enum Credentials {
         password_var: String,
     },
     /// Literal — for local development only.
-    Inline {
-        username: String,
-        password: String,
-    },
+    Inline { username: String, password: String },
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -85,12 +86,24 @@ pub struct LoggingConfig {
     pub audit_log_path: Option<String>,
 }
 
-fn default_idle_timeout_read_s() -> u64 { 600 }
-fn default_idle_timeout_write_s() -> u64 { 60 }
-fn default_idle_timeout_schema_s() -> u64 { 60 }
-fn default_session_ttl_s() -> u64 { 3600 }
-fn default_result_cap() -> usize { 500 }
-fn default_true() -> bool { true }
+fn default_idle_timeout_read_s() -> u64 {
+    600
+}
+fn default_idle_timeout_write_s() -> u64 {
+    60
+}
+fn default_idle_timeout_schema_s() -> u64 {
+    60
+}
+fn default_session_ttl_s() -> u64 {
+    3600
+}
+fn default_result_cap() -> usize {
+    500
+}
+fn default_true() -> bool {
+    true
+}
 
 impl Config {
     pub fn load_from_path(path: &Path) -> anyhow::Result<Self> {
@@ -127,10 +140,11 @@ impl Config {
 
     pub fn typedb_credentials(&self) -> anyhow::Result<(String, String)> {
         match &self.typedb.credentials {
-            Credentials::Inline { username, password } => {
-                Ok((username.clone(), password.clone()))
-            }
-            Credentials::Env { username_var, password_var } => {
+            Credentials::Inline { username, password } => Ok((username.clone(), password.clone())),
+            Credentials::Env {
+                username_var,
+                password_var,
+            } => {
                 let u = std::env::var(username_var)
                     .map_err(|_| anyhow::anyhow!("env var {username_var} not set"))?;
                 let p = std::env::var(password_var)

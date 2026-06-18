@@ -29,7 +29,9 @@ impl std::fmt::Debug for Extensions {
 }
 
 impl Extensions {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     pub fn get<T: Send + Sync + 'static>(&self) -> Option<&T> {
         self.map
@@ -76,8 +78,12 @@ impl Extensions {
         self.map.contains_key(&TypeId::of::<T>())
     }
 
-    pub fn len(&self) -> usize { self.map.len() }
-    pub fn is_empty(&self) -> bool { self.map.is_empty() }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
 }
 
 #[cfg(test)]

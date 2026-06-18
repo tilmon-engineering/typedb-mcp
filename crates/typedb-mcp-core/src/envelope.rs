@@ -31,7 +31,9 @@ pub const ENVELOPE_VERSION: u32 = 1;
 pub struct NextMoves(Vec<String>);
 
 impl NextMoves {
-    pub fn empty() -> Self { Self::default() }
+    pub fn empty() -> Self {
+        Self::default()
+    }
 
     pub fn new<I, S>(lines: I) -> Self
     where
@@ -61,16 +63,24 @@ impl NextMoves {
         Self::new(next_moves::on_error(class, db_hint))
     }
 
-    pub fn as_slice(&self) -> &[String] { &self.0 }
-    pub fn into_inner(self) -> Vec<String> { self.0 }
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+    pub fn into_inner(self) -> Vec<String> {
+        self.0
+    }
 }
 
 impl From<NextMoves> for Vec<String> {
-    fn from(m: NextMoves) -> Self { m.0 }
+    fn from(m: NextMoves) -> Self {
+        m.0
+    }
 }
 
 impl From<Vec<String>> for NextMoves {
-    fn from(v: Vec<String>) -> Self { Self(v) }
+    fn from(v: Vec<String>) -> Self {
+        Self(v)
+    }
 }
 
 /// Top-level envelope serialized into every tool response.
@@ -227,7 +237,9 @@ pub fn extract_codes(message: &str) -> Vec<String> {
             if let Some(end_rel) = message[i + 1..].find(']') {
                 let code = &message[i + 1..i + 1 + end_rel];
                 if !code.is_empty()
-                    && code.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+                    && code
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
                 {
                     out.push(code.to_owned());
                 }
@@ -258,10 +270,12 @@ pub mod next_moves {
             "Pass `session_id` to EVERY subsequent tool call.".into(),
             "The `databases` list above is the same content `list_databases` \
              returns; pick one and call `get_schema(session_id=..., \
-             database=<name>)` before opening any transaction on it.".into(),
+             database=<name>)` before opening any transaction on it."
+                .into(),
             "Sessions expire after a configured period of inactivity. On \
              `SESSION_EXPIRED` or `SESSION_UNKNOWN` from any tool, call \
-             `start_session` again for a fresh ID.".into(),
+             `start_session` again for a fresh ID."
+                .into(),
         ]
     }
 
@@ -278,7 +292,8 @@ pub mod next_moves {
     pub fn on_session_unknown() -> Vec<String> {
         vec![
             "Call `start_session` to mint a fresh `session_id`, then reissue \
-             the call you just made with the new ID.".into(),
+             the call you just made with the new ID."
+                .into(),
         ]
     }
 
@@ -286,7 +301,8 @@ pub mod next_moves {
         vec![
             "Your previous session is gone (idle TTL). Call `start_session` \
              to mint a fresh `session_id`; you will need to re-call \
-             `get_schema` on any database before opening transactions.".into(),
+             `get_schema` on any database before opening transactions."
+                .into(),
         ]
     }
 
@@ -294,19 +310,45 @@ pub mod next_moves {
         vec![
             "Call `get_schema(session_id=..., database=<name>)` for any \
              database before opening a transaction on it or calling \
-             `read_once`.".into(),
+             `read_once`."
+                .into(),
+        ]
+    }
+
+    pub fn after_create_database(db: &str) -> Vec<String> {
+        vec![
+            "Call `list_databases(session_id=...)` to confirm the database \
+             now appears."
+                .into(),
+            format!(
+                "Call `get_schema(session_id=..., database=\"{db}\")` before opening any transaction on it."
+            ),
+            format!(
+                "If you intend to define schema, call `open_schema(session_id=..., database=\"{db}\")` after reading the current schema."
+            ),
+        ]
+    }
+
+    pub fn after_delete_database() -> Vec<String> {
+        vec![
+            "Call `list_databases(session_id=...)` to confirm the database no longer appears.".into(),
+            "If this deletion was accidental, stop and surface it to the human/operator immediately.".into(),
         ]
     }
 
     pub fn after_get_schema(db: &str) -> Vec<String> {
         vec![
-            format!("Open a transaction on `{db}`: \
+            format!(
+                "Open a transaction on `{db}`: \
                      `open_read(session_id=..., database=\"{db}\")` for queries, \
                      `open_write(session_id=..., database=\"{db}\")` for mutations, \
                      or `open_schema(session_id=..., database=\"{db}\")` for \
-                     schema changes."),
-            format!("Or run a one-shot read with \
-                     `read_once(session_id=..., database=\"{db}\", query=...)`."),
+                     schema changes."
+            ),
+            format!(
+                "Or run a one-shot read with \
+                     `read_once(session_id=..., database=\"{db}\", query=...)`."
+            ),
         ]
     }
 
@@ -316,10 +358,12 @@ pub mod next_moves {
              fetch { ... };\")`. Repeat for as many reads as you need. \
              READ transactions accept reads ONLY — `insert`/`delete`/`update` \
              and `define`/`undefine`/`redefine` will be rejected; open a \
-             write or schema transaction instead.".into(),
+             write or schema transaction instead."
+                .into(),
             "Close the transaction with `rollback(session_id=...)` when done. \
              READ transactions cannot be committed (TypeDB will reject this \
-             with TSV2).".into(),
+             with TSV2)."
+                .into(),
             format!("Open transaction is on database `{db}`."),
         ]
     }
@@ -332,11 +376,13 @@ pub mod next_moves {
              the same transaction. Reads see your in-tx writes \
              (read-your-writes). Schema statements (`define`/`undefine`/\
              `redefine`) are NOT permitted here — open a schema transaction \
-             for those.".into(),
+             for those."
+                .into(),
             "End with `commit(session_id=...)` to persist, or \
              `rollback(session_id=...)` to discard. A write that reaches \
              TypeDB's write pipeline and fails will ABORT the transaction \
-             automatically; you'll then need to open a new one.".into(),
+             automatically; you'll then need to open a new one."
+                .into(),
             format!("Open transaction is on database `{db}`."),
         ]
     }
@@ -349,12 +395,15 @@ pub mod next_moves {
              `delete`/`update`) AND reads (`match`/`fetch`) in any order \
              within the same transaction. You do NOT need to commit and \
              reopen to run a read query — just issue another `query` call \
-             on this same session.".into(),
-            format!("End with `commit(session_id=...)` to persist (this will \
+             on this same session."
+                .into(),
+            format!(
+                "End with `commit(session_id=...)` to persist (this will \
                      CLEAR the schema-read gate for `{db}` — you'll need to \
                      call `get_schema(session_id=..., database=\"{db}\")` \
                      again before opening further transactions on it), or \
-                     `rollback(session_id=...)` to discard."),
+                     `rollback(session_id=...)` to discard."
+            ),
             format!("Open transaction is on database `{db}`."),
         ]
     }
@@ -365,23 +414,28 @@ pub mod next_moves {
                 "Continue with more `query(session_id=..., ...)` calls on \
                  this READ transaction. Reads only — `insert`/`delete`/\
                  `update` and `define`/`undefine`/`redefine` will be \
-                 rejected here.".into(),
+                 rejected here."
+                    .into(),
                 "Close with `rollback(session_id=...)` when done (READ \
-                 transactions cannot be committed).".into(),
+                 transactions cannot be committed)."
+                    .into(),
             ),
             TxKind::Write => (
                 "Continue with more `query(session_id=..., ...)` calls on \
                  this WRITE transaction. Reads and data writes can be \
                  interleaved freely; reads see your in-tx writes. Schema \
-                 statements are not permitted here.".into(),
+                 statements are not permitted here."
+                    .into(),
                 "End with `commit(session_id=...)` to persist, or \
-                 `rollback(session_id=...)` to discard.".into(),
+                 `rollback(session_id=...)` to discard."
+                    .into(),
             ),
             TxKind::Schema => (
                 "Continue with more `query(session_id=..., ...)` calls on \
                  this SCHEMA transaction. You can interleave schema \
                  statements (`define`/`undefine`/`redefine`), data writes, \
-                 and reads (`match`/`fetch`) without committing in between.".into(),
+                 and reads (`match`/`fetch`) without committing in between."
+                    .into(),
                 format!(
                     "End with `commit(session_id=...)` to persist (this \
                      will CLEAR the schema-read gate for `{db}` — you'll \
@@ -399,16 +453,21 @@ pub mod next_moves {
         let mut v = vec![
             "Open another transaction with `open_read` / `open_write` / \
              `open_schema` (each takes `session_id` + `database`), or run a \
-             one-shot read with `read_once`.".into(),
+             one-shot read with `read_once`."
+                .into(),
             "Or call `get_schema(session_id=..., database=<other>)` if you \
-             want to work on a different database.".into(),
+             want to work on a different database."
+                .into(),
         ];
         if matches!(kind, TxKind::Schema) {
-            v.insert(0, format!(
-                "The schema-read gate for `{db}` was cleared by this commit. \
+            v.insert(
+                0,
+                format!(
+                    "The schema-read gate for `{db}` was cleared by this commit. \
                  Call `get_schema(session_id=..., database=\"{db}\")` again \
                  before opening any transaction on it."
-            ));
+                ),
+            );
         }
         v
     }
@@ -417,9 +476,11 @@ pub mod next_moves {
         vec![
             "Open another transaction with `open_read` / `open_write` / \
              `open_schema` (each takes `session_id` + `database`), or run a \
-             one-shot read with `read_once`.".into(),
+             one-shot read with `read_once`."
+                .into(),
             "Or call `get_schema(session_id=..., database=<other>)` to work \
-             on a different database.".into(),
+             on a different database."
+                .into(),
         ]
     }
 
@@ -427,9 +488,11 @@ pub mod next_moves {
         vec![
             "Run another `read_once(session_id=..., ...)`, or call \
              `get_schema(session_id=..., database=<other>)` for a different \
-             database.".into(),
+             database."
+                .into(),
             "If you need multiple reads or any writes, open an explicit \
-             transaction with `open_read` / `open_write` / `open_schema`.".into(),
+             transaction with `open_read` / `open_write` / `open_schema`."
+                .into(),
         ]
     }
 
@@ -437,7 +500,8 @@ pub mod next_moves {
         vec![
             "Retry the call once — the TypeDB upstream was unreachable. If the error \
              persists, the server is down or misconfigured; surface this to the human \
-             operator rather than looping.".into(),
+             operator rather than looping."
+                .into(),
         ]
     }
 
@@ -457,25 +521,36 @@ pub mod next_moves {
                 "A transaction is already open in this session. Either continue \
                  using it with `query(session_id=..., ...)`, then \
                  `commit(session_id=...)`/`rollback(session_id=...)`, or \
-                 `rollback` it now and retry this call.".into(),
+                 `rollback` it now and retry this call."
+                    .into(),
+            ],
+            ConfirmationRequired => vec![
+                "Deletion was not performed. Reissue `delete_database` only if \
+                 permanent deletion is truly intended, with `confirm_database` \
+                 exactly equal to `database`."
+                    .into(),
             ],
             NoTxOpen => vec![
                 "Open a transaction first with `open_read` / `open_write` / \
                  `open_schema` (each takes `session_id` + `database`), or use \
-                 `read_once` for a one-shot read.".into(),
+                 `read_once` for a one-shot read."
+                    .into(),
             ],
             TxIsRead => vec![
                 "READ transactions are closed with `rollback(session_id=...)`, \
-                 not `commit`. Call `rollback` instead.".into(),
+                 not `commit`. Call `rollback` instead."
+                    .into(),
             ],
             WrongTxType => vec![
                 "Your transaction is still open. Either issue a different query, or \
-                 `rollback(session_id=...)` and open a transaction of the correct kind.".into(),
+                 `rollback(session_id=...)` and open a transaction of the correct kind."
+                    .into(),
             ],
             ParseError | TypeError => vec![
                 "Your transaction is still open. Fix the query and call \
                  `query(session_id=..., ...)` again, or \
-                 `rollback(session_id=...)` to start over.".into(),
+                 `rollback(session_id=...)` to start over."
+                    .into(),
             ],
             WriteFailed => vec![
                 "The transaction has been ABORTED by TypeDB. Every write you had \
@@ -484,27 +559,33 @@ pub mod next_moves {
                  same transaction. None of them reached durable storage. Open a new \
                  transaction (typically `open_write(session_id=..., database=...)`) \
                  and re-apply every one of those prior writes in it before issuing \
-                 your replacement for the failing write.".into(),
+                 your replacement for the failing write."
+                    .into(),
                 "The schema-read gate is still valid (no schema change happened), so \
                  you do NOT need to call `get_schema` again before the next \
-                 `open_*`. This is unrelated to your *data* writes, which are gone.".into(),
+                 `open_*`. This is unrelated to your *data* writes, which are gone."
+                    .into(),
                 "Before retrying the failing write, consider re-reading the relevant \
                  *data* (the constraint that fired tells you something about reality \
                  you may not have known). Re-reading the schema is optional — useful \
-                 only if you suspect you misremembered a constraint shape.".into(),
+                 only if you suspect you misremembered a constraint shape."
+                    .into(),
             ],
             CommitFailed => vec![
                 "The transaction is closed and no changes were persisted. Open a new \
                  transaction with `open_write(session_id=..., database=...)` (or \
-                 `open_schema`) to retry.".into(),
+                 `open_schema`) to retry."
+                    .into(),
                 "Before retrying, read back the existing data — a commit-time \
                  cardinality violation often means another instance is required, or \
-                 you missed an attribute.".into(),
+                 you missed an attribute."
+                    .into(),
             ],
             ResultLimitExceeded => vec![
                 "Re-issue the query with `sort $k; offset N; limit M;` — `offset` MUST \
                  come before `limit` (pipeline stages run in textual order). Your \
-                 transaction is still open.".into(),
+                 transaction is still open."
+                    .into(),
             ],
             TransientConflict => vec![
                 "TypeDB aborted this call because of a concurrent transaction \
@@ -512,27 +593,33 @@ pub mod next_moves {
                  on the first call issued right after a successful `commit`. No \
                  state was damaged; simply retry the failing call as-is. If the \
                  same call fails this way more than a couple of times in a row, \
-                 escalate (it is no longer a transient).".into(),
+                 escalate (it is no longer a transient)."
+                    .into(),
             ],
             Timeout | IdleTimeout => vec![
                 "The transaction is gone. Open a new one with `open_read` / \
                  `open_write` / `open_schema` (each takes `session_id` + \
-                 `database`) to continue.".into(),
+                 `database`) to continue."
+                    .into(),
             ],
             UnknownDatabase => vec![
                 "Call `list_databases(session_id=...)` to see the available \
-                 database names.".into(),
+                 database names."
+                    .into(),
             ],
             UpstreamUnavailable => on_upstream_unavailable(),
             Unclassified => vec![
                 "Assume the transaction (if any) is gone. Open a new one with \
-                 `open_read` / `open_write` / `open_schema` if you intend to continue.".into(),
+                 `open_read` / `open_write` / `open_schema` if you intend to continue."
+                    .into(),
                 "The full TypeDB error is preserved verbatim in `error.message` (after \
                  `(details: ...)`), and every bracketed upstream code is in \
-                 `error.typedb_codes` — quote them when reporting to the human operator.".into(),
+                 `error.typedb_codes` — quote them when reporting to the human operator."
+                    .into(),
                 "If this class recurs, escalate: it likely means TypeDB introduced a new \
                  error code post-dating this server's classifier, and someone needs to \
-                 update `classify_typedb_error` in `src/error.rs` to recognize it.".into(),
+                 update `classify_typedb_error` in `src/error.rs` to recognize it."
+                    .into(),
             ],
         }
     }

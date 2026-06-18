@@ -169,11 +169,13 @@ helpers; `TxOutcome::{Commit, Rollback}` for write/schema closures;
   `crates/typedb-mcp-core/reference/`, `crates/typedb-mcp/src/`,
   `crates/example-semantic-mcp/src/`, `DESIGN.md`, `AGENTS.md`, root
   and per-crate `Cargo.toml`.
-- The ten tools enumerated in `DESIGN.md` §7 (`start_session` plus the
-  nine TypeDB-facing tools) are the entire agent-facing surface of the
-  reference binary. Adding an eleventh tool is a design change, not an
-  implementation change — update `DESIGN.md` first. (Library consumers
-  may of course add their own semantic tools alongside.)
+- The ten tools enumerated in `DESIGN.md` §7.0-§7.9 (`start_session` plus
+  the nine TypeDB-facing tools) are the default agent-facing surface of the
+  reference binary. The only built-in extra tools are the optional database
+  admin tools in §7.10-§7.11, absent unless explicitly enabled by operator
+  config. Adding any other tool is a design change, not an implementation
+  change — update `DESIGN.md` first. (Library consumers may of course add
+  their own semantic tools alongside.)
 - The public surface re-exported from `typedb-mcp-core`'s `lib.rs` is
   the library contract. Breaking changes there are a `DESIGN.md` §11
   change first; see "Versioning and stability" in §11.6.

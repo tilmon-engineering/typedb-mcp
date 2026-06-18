@@ -2,8 +2,9 @@
 //!
 //! Two kinds of consumer:
 //!
-//! 1. **The reference binary** (`typedb-mcp`): mounts the ten raw tools
-//!    via the [`tools`] router and ships them as-is.
+//! 1. **The reference binary** (`typedb-mcp`): mounts the ten default raw
+//!    tools via the [`tools`] router, plus optional database-admin tools
+//!    only when explicitly enabled by operator config.
 //! 2. **Other MCP servers** that want to embed TypeDB safety semantics
 //!    alongside semantic tools of their own. They construct a
 //!    [`TypeDbCore`], implement [`HasTypeDbCore`] on their handler
@@ -26,7 +27,7 @@ pub mod session;
 pub mod tools;
 pub mod typedb;
 
-pub use crate::core::{HasTypeDbCore, SessionHandle, TypeDbCore, TxOutcome};
+pub use crate::core::{HasTypeDbCore, SessionHandle, TxOutcome, TypeDbCore};
 pub use crate::envelope::{
     AgentEnvelope, ENVELOPE_VERSION, ErrorPayload, NextMoves, envelope_err, envelope_ok,
     envelope_state_error, envelope_state_error_no_session, explain_query_error, extract_codes,

@@ -58,8 +58,7 @@ impl TypeDbClient {
         password: &str,
         tls_enabled: bool,
     ) -> Result<Self, InternalError> {
-        let addresses = Addresses::try_from_address_str(address)
-            .map_err(InternalError::Driver)?;
+        let addresses = Addresses::try_from_address_str(address).map_err(InternalError::Driver)?;
         let credentials = Credentials::new(username, password);
         let tls = if tls_enabled {
             DriverTlsConfig::enabled_with_native_root_ca()
@@ -70,18 +69,30 @@ impl TypeDbClient {
         let driver = TypeDBDriver::new(addresses, credentials, options)
             .await
             .map_err(InternalError::Driver)?;
-        Ok(Self { driver: Arc::new(driver) })
+        Ok(Self {
+            driver: Arc::new(driver),
+        })
     }
 
     /// List database names.
     pub async fn list_databases(&self) -> Result<Vec<String>, InternalError> {
-        let dbs = self.driver.databases().all().await.map_err(InternalError::Driver)?;
+        let dbs = self
+            .driver
+            .databases()
+            .all()
+            .await
+            .map_err(InternalError::Driver)?;
         Ok(dbs.into_iter().map(|d| d.name().to_owned()).collect())
     }
 
     /// Fetch the full TypeQL `define` source for a database.
     pub async fn get_schema(&self, name: &str) -> Result<String, InternalError> {
-        let db = self.driver.databases().get(name).await.map_err(InternalError::Driver)?;
+        let db = self
+            .driver
+            .databases()
+            .get(name)
+            .await
+            .map_err(InternalError::Driver)?;
         db.schema().await.map_err(InternalError::Driver)
     }
 
@@ -104,8 +115,8 @@ impl TypeDbClient {
         let _ = self.driver.force_close();
     }
 
-    /// Create a database. Used by tests and is not exposed as an MCP tool —
-    /// agents should not create databases.
+    /// Create a database. Used by tests and optional admin MCP tools; the
+    /// admin tools are disabled by default and must be operator-enabled.
     pub async fn create_database(&self, name: &str) -> Result<(), InternalError> {
         self.driver
             .databases()
@@ -114,9 +125,15 @@ impl TypeDbClient {
             .map_err(InternalError::Driver)
     }
 
-    /// Delete a database. Used by tests; explicitly NOT exposed as a tool.
+    /// Delete a database. Used by tests and optional admin MCP tools; the
+    /// admin tools are disabled by default and require explicit confirmation.
     pub async fn delete_database(&self, name: &str) -> Result<(), InternalError> {
-        let db = self.driver.databases().get(name).await.map_err(InternalError::Driver)?;
+        let db = self
+            .driver
+            .databases()
+            .get(name)
+            .await
+            .map_err(InternalError::Driver)?;
         db.delete().await.map_err(InternalError::Driver)
     }
 }
@@ -307,7 +324,10 @@ fn value_to_json(v: &typedb_driver::concept::Value) -> serde_json::Value {
             for (k, maybe_v) in s.fields() {
                 fields.insert(
                     k.clone(),
-                    maybe_v.as_ref().map(value_to_json).unwrap_or(serde_json::Value::Null),
+                    maybe_v
+                        .as_ref()
+                        .map(value_to_json)
+                        .unwrap_or(serde_json::Value::Null),
                 );
             }
             serde_json::json!({ "structType": type_name, "fields": fields })
@@ -324,9 +344,9 @@ fn driver_json_to_serde(j: typedb_driver::answer::JSON) -> serde_json::Value {
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         J::String(s) => serde_json::Value::String(s.into_owned()),
-        J::Array(items) => serde_json::Value::Array(
-            items.into_iter().map(driver_json_to_serde).collect(),
-        ),
+        J::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(driver_json_to_serde).collect())
+        }
         J::Object(map) => serde_json::Value::Object(
             map.into_iter()
                 .map(|(k, v)| (k.into_owned(), driver_json_to_serde(v)))

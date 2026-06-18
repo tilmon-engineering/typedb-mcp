@@ -9,8 +9,9 @@
 //! 2. Serve as a worked example of a `HasTypeDbCore` implementation
 //!    that library consumers can crib from.
 //!
-//! All ten raw tools live in [`crate::tools`] — see DESIGN.md §11 for
-//! the library extension API.
+//! The default ten raw tools, plus explicitly enabled optional admin
+//! tools, live in [`crate::tools`] — see DESIGN.md §11 for the library
+//! extension API.
 
 use std::sync::Arc;
 
@@ -21,8 +22,9 @@ use rmcp::{
         GetPromptRequestParams, GetPromptResult, ListPromptsResult, PaginatedRequestParams,
         PromptMessage, PromptMessageRole, ServerCapabilities, ServerInfo,
     },
-    prompt, prompt_handler, prompt_router, tool_handler,
+    prompt, prompt_handler, prompt_router,
     service::RequestContext,
+    tool_handler,
 };
 
 use crate::{
@@ -56,7 +58,9 @@ impl TypeDbMcp {
     /// kernel use this; consumers writing their own handler implement
     /// [`HasTypeDbCore`] on it directly.
     pub fn from_core(core: Arc<TypeDbCore>) -> Self {
-        let tool_router = raw_tools_router::<Self>(RawToolsConfig::default());
+        let raw_cfg = RawToolsConfig::default()
+            .with_database_admin_tools(core.config.server.enable_database_admin_tools);
+        let tool_router = raw_tools_router::<Self>(raw_cfg);
         let prompt_router = Self::prompt_router();
         Self {
             core,

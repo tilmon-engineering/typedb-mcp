@@ -25,6 +25,9 @@ pub enum ErrorClass {
     SchemaNotRead,
     /// A second `open_*` issued while a transaction is already open.
     TxAlreadyOpen,
+    /// A destructive operation was requested without the required explicit
+    /// confirmation value.
+    ConfirmationRequired,
     /// `query` / `commit` issued with no transaction open.
     NoTxOpen,
     /// `commit` on a read tx (maps `TSV2`).
@@ -93,12 +96,7 @@ impl ErrorClass {
         use ErrorClass::*;
         matches!(
             self,
-            WrongTxType
-                | ParseError
-                | TypeError
-                | ResultLimitExceeded
-                | TxIsRead
-                | TxAlreadyOpen
+            WrongTxType | ParseError | TypeError | ResultLimitExceeded | TxIsRead | TxAlreadyOpen
         )
         // SessionUnknown/SessionExpired deliberately false: there IS no
         // session, so by definition no tx is alive.
@@ -348,10 +346,7 @@ mod tests {
 
     #[test]
     fn dvl_alone_is_write_failed() {
-        let c = classify_typedb_error(
-            "DVL3",
-            "[DVL3] Data validation failed for some new reason.",
-        );
+        let c = classify_typedb_error("DVL3", "[DVL3] Data validation failed for some new reason.");
         assert_eq!(c, ErrorClass::WriteFailed);
         assert!(!c.retriable_in_same_tx());
     }
@@ -370,10 +365,7 @@ mod tests {
 
     #[test]
     fn txn2_is_timeout() {
-        let c = classify_typedb_error(
-            "TXN2",
-            "[TXN2] Write exclusivity acquisition timed out.",
-        );
+        let c = classify_typedb_error("TXN2", "[TXN2] Write exclusivity acquisition timed out.");
         assert_eq!(c, ErrorClass::Timeout);
         assert!(!c.retriable_in_same_tx());
     }

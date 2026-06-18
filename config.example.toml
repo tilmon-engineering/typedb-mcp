@@ -18,6 +18,9 @@ listen_stdio          = true
 # allowed_hosts = ["typedb-mcp.typedb.svc:8001", "typedb-mcp.example.com"]
 # Or disable the check entirely (only if upstream network isolation is enforced):
 # allowed_hosts = []
+# Disabled by default. When true, exposes destructive database-admin tools:
+# create_database and delete_database. Enable only for trusted/scratch deployments.
+# enable_database_admin_tools = false
 
 [typedb]
 address     = "127.0.0.1:1729"        # gRPC host:port; no scheme

@@ -70,7 +70,9 @@ impl ExampleMcp {
 }
 
 impl HasTypeDbCore for ExampleMcp {
-    fn typedb_core(&self) -> &Arc<TypeDbCore> { &self.core }
+    fn typedb_core(&self) -> &Arc<TypeDbCore> {
+        &self.core
+    }
 }
 
 // ---------- semantic tool params -----------------------------------------
@@ -104,8 +106,10 @@ impl ExampleMcp {
     /// Demonstrates `with_read_tx` — the kernel handles the schema-read
     /// gate, single-tx invariant, kind-correct release, error
     /// classification, and envelope construction.
-    #[tool(description = "Count instances of an entity type in the given database. \
-                          Read-only; requires prior `get_schema(database)`.")]
+    #[tool(
+        description = "Count instances of an entity type in the given database. \
+                          Read-only; requires prior `get_schema(database)`."
+    )]
     async fn count_entities(
         &self,
         Parameters(p): Parameters<CountEntitiesParams>,
@@ -116,7 +120,11 @@ impl ExampleMcp {
         };
         // Defend the input minimally — a TypeQL label is a sane subset of
         // ASCII identifiers. Real consumers would do schema-aware checks.
-        if !p.entity_type.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        if !p
+            .entity_type
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
             return Ok(session
                 .state_err(
                     typedb_mcp_core::ErrorClass::ParseError,
@@ -193,9 +201,7 @@ impl ExampleMcp {
         Ok(session
             .ok(
                 serde_json::json!({ "entity_id": p.entity_id }),
-                NextMoves::new([
-                    "Read back with `current_focus(session_id=...)`.",
-                ]),
+                NextMoves::new(["Read back with `current_focus(session_id=...)`."]),
             )
             .await)
     }

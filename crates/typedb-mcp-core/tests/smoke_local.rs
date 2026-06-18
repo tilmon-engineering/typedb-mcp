@@ -36,14 +36,19 @@ async fn list_databases_and_get_schema() {
     drop(db);
 
     let schema = client.get_schema(&existing).await.expect("get_schema");
-    eprintln!("schema for {existing} (first 200 chars): {}", &schema.chars().take(200).collect::<String>());
+    eprintln!(
+        "schema for {existing} (first 200 chars): {}",
+        &schema.chars().take(200).collect::<String>()
+    );
 
     // Open a read tx and run a trivial query to confirm the live Transaction works.
     let tx = client
         .open_transaction(&existing, TxKind::Read)
         .await
         .expect("open_transaction");
-    let answer = tx.query("match $x isa $t; limit 1; fetch { \"type\": $t };").await;
+    let answer = tx
+        .query("match $x isa $t; limit 1; fetch { \"type\": $t };")
+        .await;
     eprintln!("query result: {:?}", answer.is_ok());
     let _ = tx.rollback().await;
 }

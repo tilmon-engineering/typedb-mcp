@@ -101,7 +101,9 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub fn new() -> Arc<Self> { Arc::new(Self::default()) }
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
 
     /// Mint a brand-new session and return its ID. The session is
     /// initialized with no schema reads, no open tx, and a fresh TTL.

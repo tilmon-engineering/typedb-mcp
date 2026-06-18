@@ -11,6 +11,8 @@ idle_timeout_schema_s = 60
 result_cap            = 500
 listen_stdio          = true
 # listen_http intentionally omitted: stdio-only when launched by .mcp.json.
+# Disabled by default. Enable only for trusted/scratch deployments.
+# enable_database_admin_tools = false
 
 [typedb]
 address     = "127.0.0.1:1729"

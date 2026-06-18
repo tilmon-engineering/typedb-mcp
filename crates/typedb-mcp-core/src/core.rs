@@ -60,7 +60,11 @@ impl TypeDbCore {
         typedb: Arc<TypeDbClient>,
         sessions: Arc<SessionStore>,
     ) -> Arc<Self> {
-        Arc::new(Self { config, typedb, sessions })
+        Arc::new(Self {
+            config,
+            typedb,
+            sessions,
+        })
     }
 
     /// Connect to TypeDB using the credentials in `config`, allocate a
@@ -94,7 +98,12 @@ impl TypeDbCore {
         let session_ttl = self.config.session_ttl();
         tokio::spawn(async move {
             crate::session::run_reaper(
-                sessions, read_idle, write_idle, schema_idle, tick, session_ttl,
+                sessions,
+                read_idle,
+                write_idle,
+                schema_idle,
+                tick,
+                session_ttl,
             )
             .await
         })
@@ -120,13 +129,18 @@ impl TypeDbCore {
     ///     Err(env) => return Ok(env),
     /// };
     /// ```
-    pub async fn resolve<'a>(&'a self, session_id: &str)
-        -> Result<SessionHandle<'a>, CallToolResult>
-    {
+    pub async fn resolve<'a>(
+        &'a self,
+        session_id: &str,
+    ) -> Result<SessionHandle<'a>, CallToolResult> {
         let sid = SessionId(session_id.to_owned());
         let ttl = self.config.session_ttl();
         match self.sessions.resolve_and_touch(&sid, ttl).await {
-            Ok(arc) => Ok(SessionHandle { core: self, id: sid, arc }),
+            Ok(arc) => Ok(SessionHandle {
+                core: self,
+                id: sid,
+                arc,
+            }),
             Err(SessionResolveError::Unknown) => Err(envelope_state_error_no_session(
                 ErrorClass::SessionUnknown,
                 "Unknown `session_id`. The server has no session with this ID. \
@@ -170,8 +184,12 @@ pub struct SessionHandle<'a> {
 }
 
 impl<'a> SessionHandle<'a> {
-    pub fn id(&self) -> &SessionId { &self.id }
-    pub fn core(&self) -> &'a TypeDbCore { self.core }
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+    pub fn core(&self) -> &'a TypeDbCore {
+        self.core
+    }
 
     /// Direct access to the per-session `Arc<Mutex<SessionState>>`.
     /// Library consumers should prefer the higher-level helpers
@@ -180,7 +198,9 @@ impl<'a> SessionHandle<'a> {
     /// kernel-internal raw tool implementations and for the rare
     /// consumer that needs to compose multiple state inspections under
     /// a single lock acquisition.
-    pub fn arc(&self) -> &Arc<Mutex<SessionState>> { &self.arc }
+    pub fn arc(&self) -> &Arc<Mutex<SessionState>> {
+        &self.arc
+    }
 
     /// Snapshot the agent-visible session block for use in an envelope.
     pub async fn snapshot(&self) -> SessionSnapshot {
@@ -285,7 +305,12 @@ impl<'a> SessionHandle<'a> {
                 .await;
         }
 
-        let tx = match self.core.typedb.open_transaction(database, TxKind::Read).await {
+        let tx = match self
+            .core
+            .typedb
+            .open_transaction(database, TxKind::Read)
+            .await
+        {
             Ok(t) => t,
             Err(e) => {
                 drop(state);
@@ -310,8 +335,7 @@ impl<'a> SessionHandle<'a> {
 
         match result {
             Ok(value) => {
-                let json = serde_json::to_value(&value)
-                    .unwrap_or(serde_json::Value::Null);
+                let json = serde_json::to_value(&value).unwrap_or(serde_json::Value::Null);
                 self.ok(json, hints_on_ok).await
             }
             Err(e) => {
@@ -341,7 +365,8 @@ impl<'a> SessionHandle<'a> {
         F: AsyncFnOnce(&DriverTransaction) -> Result<TxOutcome<T>, InternalError>,
         T: Serialize,
     {
-        self.with_owned_tx(database, TxKind::Write, hints_on_ok, f).await
+        self.with_owned_tx(database, TxKind::Write, hints_on_ok, f)
+            .await
     }
 
     /// Run a closure inside a SCHEMA transaction. Same semantics as
@@ -358,7 +383,8 @@ impl<'a> SessionHandle<'a> {
         F: AsyncFnOnce(&DriverTransaction) -> Result<TxOutcome<T>, InternalError>,
         T: Serialize,
     {
-        self.with_owned_tx(database, TxKind::Schema, hints_on_ok, f).await
+        self.with_owned_tx(database, TxKind::Schema, hints_on_ok, f)
+            .await
     }
 
     /// Borrow the session's currently-open transaction (whatever kind),
@@ -366,11 +392,7 @@ impl<'a> SessionHandle<'a> {
     /// (e.g. a semantic `query`-style tool). Emits `NO_TX_OPEN` if no
     /// transaction is open. Does NOT commit, rollback, or close — the
     /// agent retains ownership of the transaction lifecycle.
-    pub async fn with_current_tx<F, T>(
-        &self,
-        hints_on_ok: NextMoves,
-        f: F,
-    ) -> CallToolResult
+    pub async fn with_current_tx<F, T>(&self, hints_on_ok: NextMoves, f: F) -> CallToolResult
     where
         F: AsyncFnOnce(&DriverTransaction, TxKind, &str) -> Result<T, InternalError>,
         T: Serialize,
@@ -397,8 +419,7 @@ impl<'a> SessionHandle<'a> {
         match result {
             Ok(value) => {
                 drop(state);
-                let json = serde_json::to_value(&value)
-                    .unwrap_or(serde_json::Value::Null);
+                let json = serde_json::to_value(&value).unwrap_or(serde_json::Value::Null);
                 self.ok(json, hints_on_ok).await
             }
             Err(e) => {
@@ -483,8 +504,7 @@ impl<'a> SessionHandle<'a> {
                             let mut s = self.arc.lock().await;
                             s.schema_seen.remove(database);
                         }
-                        let json = serde_json::to_value(&value)
-                            .unwrap_or(serde_json::Value::Null);
+                        let json = serde_json::to_value(&value).unwrap_or(serde_json::Value::Null);
                         self.ok(json, hints_on_ok).await
                     }
                     Err(e) => {
@@ -505,8 +525,7 @@ impl<'a> SessionHandle<'a> {
                 if let Err(e) = tx.rollback().await {
                     tracing::warn!(error = %e, ?kind, "with_*_tx rollback returned an error");
                 }
-                let json = serde_json::to_value(&value)
-                    .unwrap_or(serde_json::Value::Null);
+                let json = serde_json::to_value(&value).unwrap_or(serde_json::Value::Null);
                 self.ok(json, hints_on_ok).await
             }
             Err(e) => {

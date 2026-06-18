@@ -1,5 +1,6 @@
-//! Generic raw tool router — exposes the ten tools enumerated in
-//! DESIGN.md §7 against any handler type `H: HasTypeDbCore`.
+//! Generic raw tool router — exposes the ten default tools enumerated in
+//! DESIGN.md §7, plus optional database-admin tools when explicitly enabled,
+//! against any handler type `H: HasTypeDbCore`.
 //!
 //! This module is the library equivalent of the macro-generated tool
 //! router in [`crate::handler`]: it is written without `#[tool_router]`
@@ -63,21 +64,46 @@ pub struct SessionOnlyParams {
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct SessionAndDatabaseParams {
+    /// Server-issued session identifier. Obtain one from `start_session`.
     pub session_id: String,
+    /// Name of the TypeDB database to use for this operation.
     pub database: String,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct SessionAndQueryParams {
+    /// Server-issued session identifier. Obtain one from `start_session`.
     pub session_id: String,
+    /// TypeQL query to execute against the currently-open transaction.
     pub query: String,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct ReadOnceParams {
+    /// Server-issued session identifier. Obtain one from `start_session`.
     pub session_id: String,
+    /// Name of the TypeDB database to read. You must call `get_schema` for it first.
     pub database: String,
+    /// TypeQL read query to run in a managed read transaction.
     pub query: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct CreateDatabaseParams {
+    /// Server-issued session identifier. Obtain one from `start_session`.
+    pub session_id: String,
+    /// Name of the TypeDB database to create.
+    pub database: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct DeleteDatabaseParams {
+    /// Server-issued session identifier. Obtain one from `start_session`.
+    pub session_id: String,
+    /// Name of the TypeDB database to permanently delete.
+    pub database: String,
+    /// Must exactly equal `database` to confirm permanent deletion.
+    pub confirm_database: String,
 }
 
 // ---------- canonical tool descriptions ----------------------------------
@@ -148,6 +174,20 @@ is opened, the query is run, and the transaction is closed atomically. \
 Requires prior `get_schema(database)`. Result is capped (see config); \
 paginate with `sort $k; offset N; limit M;`.";
 
+const DESC_CREATE_DATABASE: &str = "\
+Create a database on the TypeDB server. This admin tool is disabled unless \
+the operator explicitly enables database admin tools in server config. \
+Requires a valid `session_id` and fails if this session has an open \
+transaction. After creation, call `list_databases`, then `get_schema`, and \
+use `open_schema` if you intend to define schema.";
+
+const DESC_DELETE_DATABASE: &str = "\
+Permanently delete a TypeDB database, including all schema and data. This \
+destructive admin tool is disabled by default and only appears when the \
+operator explicitly enables database admin tools. Requires a valid \
+`session_id`, rejects while transactions are open on the target database, \
+and requires `confirm_database` to exactly equal `database`.";
+
 // ---------- canonical names ----------------------------------------------
 
 pub mod names {
@@ -161,6 +201,10 @@ pub mod names {
     pub const COMMIT: &str = "commit";
     pub const ROLLBACK: &str = "rollback";
     pub const READ_ONCE: &str = "read_once";
+    pub const CREATE_DATABASE: &str = "create_database";
+    pub const DELETE_DATABASE: &str = "delete_database";
+
+    pub const ADMIN_ALL: &[&str] = &[CREATE_DATABASE, DELETE_DATABASE];
 
     pub const ALL: &[&str] = &[
         START_SESSION,
@@ -183,14 +227,24 @@ pub mod names {
 pub struct RawToolsConfig {
     prefix: Option<String>,
     omit: HashSet<String>,
+    include_database_admin: bool,
 }
 
 impl RawToolsConfig {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Prepend `prefix` to every raw tool name (e.g. `"tdb_"` → `tdb_query`).
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Include optional database-admin tools. These are omitted by default
+    /// because `delete_database` is destructive.
+    pub fn with_database_admin_tools(mut self, enabled: bool) -> Self {
+        self.include_database_admin = enabled;
         self
     }
 
@@ -218,8 +272,9 @@ impl RawToolsConfig {
 
 // ---------- the router builder -------------------------------------------
 
-/// Build a [`ToolRouter`] carrying the ten raw TypeDB tools, generic
-/// over any handler type `H: HasTypeDbCore`.
+/// Build a [`ToolRouter`] carrying the default ten raw TypeDB tools, plus
+/// optional database-admin tools when explicitly enabled, generic over any
+/// handler type `H: HasTypeDbCore`.
 pub fn raw_tools_router<H>(config: RawToolsConfig) -> ToolRouter<H>
 where
     H: HasTypeDbCore,
@@ -284,6 +339,20 @@ where
             tool_with::<ReadOnceParams>(name, DESC_READ_ONCE),
             handler_read_once::<H>,
         ));
+    }
+    if config.include_database_admin {
+        if let Some(name) = config.resolve_name(names::CREATE_DATABASE) {
+            router.add_route(ToolRoute::new(
+                tool_with::<CreateDatabaseParams>(name, DESC_CREATE_DATABASE),
+                handler_create_database::<H>,
+            ));
+        }
+        if let Some(name) = config.resolve_name(names::DELETE_DATABASE) {
+            router.add_route(ToolRoute::new(
+                tool_with::<DeleteDatabaseParams>(name, DESC_DELETE_DATABASE),
+                handler_delete_database::<H>,
+            ));
+        }
     }
     router
 }
@@ -392,6 +461,22 @@ fn handler_read_once<H: HasTypeDbCore>(
     Box::pin(async move { Ok(do_read_once(&core, p).await) })
 }
 
+fn handler_create_database<H: HasTypeDbCore>(
+    service: &H,
+    Parameters(p): Parameters<CreateDatabaseParams>,
+) -> ToolFut<'_> {
+    let core = service.typedb_core().clone();
+    Box::pin(async move { Ok(do_create_database(&core, p).await) })
+}
+
+fn handler_delete_database<H: HasTypeDbCore>(
+    service: &H,
+    Parameters(p): Parameters<DeleteDatabaseParams>,
+) -> ToolFut<'_> {
+    let core = service.typedb_core().clone();
+    Box::pin(async move { Ok(do_delete_database(&core, p).await) })
+}
+
 // ---------- tool implementations -----------------------------------------
 //
 // Plain async functions, callable from the generic route handlers above
@@ -459,6 +544,143 @@ async fn do_list_databases(core: &TypeDbCore, p: SessionOnlyParams) -> CallToolR
             next_moves::on_upstream_unavailable(),
         ),
     }
+}
+
+async fn do_create_database(core: &TypeDbCore, p: CreateDatabaseParams) -> CallToolResult {
+    let session = match core.resolve(&p.session_id).await {
+        Ok(s) => s,
+        Err(env) => return env,
+    };
+    if let Err(message) = validate_database_name(&p.database) {
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::Unclassified,
+            &message,
+            vec![
+                "Use a non-empty database name containing only ASCII letters, digits, `_`, or `-`."
+                    .into(),
+            ],
+        );
+    }
+    let arc = session.arc().clone();
+    let state = arc.lock().await;
+    if state.tx.is_some() {
+        drop(state);
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::TxAlreadyOpen,
+            "A transaction is already open in this session. Close it with `commit` or `rollback` before creating a database.",
+            NextMoves::default_for(ErrorClass::TxAlreadyOpen, None).into_inner(),
+        );
+    }
+    drop(state);
+    match core.typedb.create_database(&p.database).await {
+        Ok(()) => envelope_ok(
+            session.snapshot().await,
+            serde_json::json!({ "created": true, "database": p.database }),
+            next_moves::after_create_database(&p.database),
+        ),
+        Err(e) => {
+            let class = e.to_class();
+            envelope_err(
+                session.snapshot().await,
+                e,
+                "Could not create database.",
+                next_moves::on_error(class, Some(&p.database)),
+            )
+        }
+    }
+}
+
+async fn do_delete_database(core: &TypeDbCore, p: DeleteDatabaseParams) -> CallToolResult {
+    let session = match core.resolve(&p.session_id).await {
+        Ok(s) => s,
+        Err(env) => return env,
+    };
+    if let Err(message) = validate_database_name(&p.database) {
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::Unclassified,
+            &message,
+            vec![
+                "Use a non-empty database name containing only ASCII letters, digits, `_`, or `-`."
+                    .into(),
+            ],
+        );
+    }
+    if p.confirm_database != p.database {
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::ConfirmationRequired,
+            "Database was NOT deleted: `confirm_database` must exactly equal `database`.",
+            next_moves::on_error(ErrorClass::ConfirmationRequired, Some(&p.database)),
+        );
+    }
+    let arc = session.arc().clone();
+    let state = arc.lock().await;
+    if state.tx.is_some() {
+        drop(state);
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::TxAlreadyOpen,
+            "A transaction is already open in this session. Close it with `commit` or `rollback` before deleting a database.",
+            NextMoves::default_for(ErrorClass::TxAlreadyOpen, None).into_inner(),
+        );
+    }
+    drop(state);
+    for (sid, arc) in core.sessions.all_sessions().await {
+        let state = arc.lock().await;
+        if state
+            .tx
+            .as_ref()
+            .is_some_and(|tx| tx.database == p.database)
+        {
+            return envelope_state_error(
+                session.snapshot().await,
+                ErrorClass::TxAlreadyOpen,
+                &format!(
+                    "Database was NOT deleted: session {} has an open transaction on `{}`. Close that transaction before retrying.",
+                    sid.0, p.database
+                ),
+                NextMoves::default_for(ErrorClass::TxAlreadyOpen, None).into_inner(),
+            );
+        }
+    }
+    match core.typedb.delete_database(&p.database).await {
+        Ok(()) => {
+            let sessions = core.sessions.all_sessions().await;
+            for (_sid, arc) in sessions {
+                arc.lock().await.schema_seen.remove(&p.database);
+            }
+            envelope_ok(
+                session.snapshot().await,
+                serde_json::json!({ "deleted": true, "database": p.database }),
+                next_moves::after_delete_database(),
+            )
+        }
+        Err(e) => {
+            let class = e.to_class();
+            envelope_err(
+                session.snapshot().await,
+                e,
+                "Could not delete database.",
+                next_moves::on_error(class, Some(&p.database)),
+            )
+        }
+    }
+}
+
+fn validate_database_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Invalid database name: name must not be empty.".into());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err("Invalid database name: use only ASCII letters, digits, `_`, or `-`.".into());
+    }
+    Ok(())
 }
 
 async fn do_get_schema(core: &TypeDbCore, p: SessionAndDatabaseParams) -> CallToolResult {
@@ -742,7 +964,11 @@ async fn do_read_once(core: &TypeDbCore, p: ReadOnceParams) -> CallToolResult {
             NextMoves::default_for(ErrorClass::SchemaNotRead, Some(&p.database)).into_inner(),
         );
     }
-    let tx = match core.typedb.open_transaction(&p.database, TxKind::Read).await {
+    let tx = match core
+        .typedb
+        .open_transaction(&p.database, TxKind::Read)
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             drop(state);

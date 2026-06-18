@@ -56,10 +56,12 @@ See [`DESIGN.md`](DESIGN.md) for the full contract.
 > against 3.10.x and below has been observed to fail at the driver
 > layer.
 
-The MCP-facing surface is ten tools served over Streamable HTTP at
+The default MCP-facing surface is ten tools served over Streamable HTTP at
 `/mcp` (or stdio for local clients):
 `start_session`, `list_databases`, `get_schema`, `open_read`,
 `open_write`, `open_schema`, `query`, `commit`, `rollback`, `read_once`.
+Optional destructive database-admin tools (`create_database`,
+`delete_database`) are absent unless explicitly enabled by operator config.
 
 ## Theory: agent affordances are user affordances
 

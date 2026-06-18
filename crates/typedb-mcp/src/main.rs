@@ -8,8 +8,7 @@ use rmcp::{
     transport::{
         stdio,
         streamable_http_server::{
-            StreamableHttpServerConfig, StreamableHttpService,
-            session::local::LocalSessionManager,
+            StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
         },
     },
 };
@@ -103,7 +102,13 @@ async fn main() -> Result<()> {
             }
         }
         let service = StreamableHttpService::new(
-            move || Ok(TypeDbMcp::new(config_h.clone(), typedb_h.clone(), sessions_h.clone())),
+            move || {
+                Ok(TypeDbMcp::new(
+                    config_h.clone(),
+                    typedb_h.clone(),
+                    sessions_h.clone(),
+                ))
+            },
             LocalSessionManager::default().into(),
             http_cfg,
         );
