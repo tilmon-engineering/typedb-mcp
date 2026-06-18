@@ -17,6 +17,39 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.1.4] — 2026-06-18
+
+### Added
+
+- Optional database-admin raw tools, `create_database` and `delete_database`,
+  gated behind `server.enable_database_admin_tools` and omitted from the
+  default ten-tool reference surface. `delete_database` requires explicit
+  `confirm_database == database` confirmation and rejects while live sessions
+  hold transactions on the target database.
+- Exact MCP tool-surface regression tests for both the default ten-tool
+  surface and the admin-enabled surface.
+- Gated in-process regressions for admin-tool safety gates, all schema-read
+  gate entry points, schema-gate clearing after schema commits, expired read
+  transaction cleanup, and continued read-transaction usability after
+  `RESULT_LIMIT_EXCEEDED`.
+
+### Fixed
+
+- Expired sessions now release any open transaction through the kind-aware
+  `OpenTx::release()` helper. This preserves the read-transaction `close()`
+  rule from `read_once` and avoids sending TypeDB an invalid rollback for a
+  READ transaction during expiry cleanup.
+- `list_databases` tests now assert the bundled TypeQL language reference on
+  `start_session`, matching the tool contract that `list_databases` returns
+  only the database list.
+- Raw tool parameter schemas now include field-level descriptions for
+  session, database, and query parameters.
+
+### Docs
+
+- `DESIGN.md`, `README.md`, `AGENTS.md`, and config templates now describe
+  the default ten-tool surface plus separately gated database-admin tools.
+
 ## [0.1.3] — 2026-06-12
 
 ### Fixed
