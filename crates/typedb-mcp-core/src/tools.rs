@@ -145,9 +145,9 @@ transaction — you must then open a new one to continue.";
 const DESC_OPEN_SCHEMA: &str = "\
 Open a SCHEMA transaction on the named database. SCHEMA changes are \
 DESTRUCTIVE and only persist on `commit`. Requires prior \
-`get_schema(database)`. On successful commit of a schema transaction, the \
-schema-read gate is reset for this database — you must call `get_schema` \
-again before opening further transactions.";
+`get_schema(database)`. On successful commit of a schema transaction, this \
+session keeps its schema-read gate for the database; other sessions must call \
+`get_schema` again before opening further transactions on that database.";
 
 const DESC_QUERY: &str = "\
 Execute a TypeQL query against the currently-open transaction. The required \
@@ -160,8 +160,9 @@ must open a new one. Results are capped (see config); paginate with \
 const DESC_COMMIT: &str = "\
 Commit the currently-open transaction. Only valid for WRITE and SCHEMA \
 transactions (READ transactions cannot be committed; use `rollback`). On \
-successful commit of a SCHEMA transaction, the schema-read gate is reset \
-for the affected database.";
+successful commit of a SCHEMA transaction, this session keeps its schema-read \
+gate for the affected database; other sessions are required to read schema \
+again before reopening transactions there.";
 
 const DESC_ROLLBACK: &str = "\
 Roll back (discard) the currently-open transaction. Forgiving: if no \
@@ -881,10 +882,12 @@ async fn do_commit(core: &TypeDbCore, p: SessionOnlyParams) -> CallToolResult {
     let commit_result = owned.transaction.commit().await;
     match commit_result {
         Ok(()) => {
-            if matches!(kind, TxKind::Schema) {
-                state.schema_seen.remove(&database);
-            }
             drop(state);
+            if matches!(kind, TxKind::Schema) {
+                core.sessions
+                    .invalidate_schema_seen_except(&database, session.id())
+                    .await;
+            }
             envelope_ok(
                 session.snapshot().await,
                 serde_json::json!({"committed": true}),

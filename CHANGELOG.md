@@ -17,6 +17,15 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-06-19
+
+### Changed
+
+- Successful schema commits now preserve the committing session's schema-read
+  gate for the changed database while invalidating other live sessions, so the
+  committer can continue without a redundant `get_schema` call and peers still
+  re-read before using stale schema.
+
 ## [0.2.1] — 2026-06-19
 
 ### Changed

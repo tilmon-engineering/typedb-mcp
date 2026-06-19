@@ -54,7 +54,7 @@ tools verbatim, prefix them, omit some, opt into the database-admin tools,
 or add semantic tools of its own — but any TypeDB-backed tool it adds
 **must** go through the library's transaction helpers, so the safety
 thesis (this section), the schema-read gate (§3.5), the single-tx
-invariant (§3.4), the schema-commit clear rule (§3.6), and the response
+invariant (§3.4), the schema-commit invalidation rule (§3.6), and the response
 envelope (§6) hold uniformly across raw and semantic tools. The library
 API is described in §11; it is the authoritative integration surface.
 
@@ -154,10 +154,12 @@ OpenTx {
 5. **Schema must be read before opening a transaction.** Each
    `open_read | open_write | open_schema` checks `schema_seen` for the
    target database. `read_once` enforces the same gate.
-6. **`schema_seen` is cleared for `db` whenever a `schema` transaction
-   committed against `db` succeeds.** The agent's mental model of the
-   schema is now stale by its own action; force a re-read before any
-   further work.
+6. **A successful `schema` commit invalidates `schema_seen` for `db` in
+   every live session except the committing session.** The committer knows
+   the schema it just wrote and may continue opening transactions on `db`
+   without re-reading. Other sessions' schema snapshots may now be stale,
+   so they must call `get_schema` again before opening further transactions
+   on `db`.
 7. **Idle reaper for open transactions.** A background task scans
    sessions and releases any transaction whose `last_activity` is older
    than its per-kind idle timeout. The timeouts are asymmetric because

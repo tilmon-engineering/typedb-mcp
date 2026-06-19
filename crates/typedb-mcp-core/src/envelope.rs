@@ -401,11 +401,11 @@ pub mod next_moves {
              on this same session."
                 .into(),
             format!(
-                "End with `commit(session_id=...)` to persist (this will \
-                     CLEAR the schema-read gate for `{db}` — you'll need to \
-                     call `get_schema(session_id=..., database=\"{db}\")` \
-                     again before opening further transactions on it), or \
-                     `rollback(session_id=...)` to discard."
+                "End with `commit(session_id=...)` to persist, or \
+                     `rollback(session_id=...)` to discard. After a schema \
+                     commit, THIS session can continue opening transactions on \
+                     `{db}` without re-reading schema; other sessions must call \
+                     `get_schema(session_id=..., database=\"{db}\")` again."
             ),
             "If the work does not need to land atomically, commit periodically \
              to checkpoint progress instead of risking a large rollback."
@@ -443,12 +443,11 @@ pub mod next_moves {
                  and reads (`match`/`fetch`) without committing in between."
                     .into(),
                 format!(
-                    "End with `commit(session_id=...)` to persist (this \
-                     will CLEAR the schema-read gate for `{db}` — you'll \
-                     need to call `get_schema(session_id=..., \
-                     database=\"{db}\")` again before opening further \
-                     transactions on it), or `rollback(session_id=...)` \
-                     to discard."
+                    "End with `commit(session_id=...)` to persist, or \
+                     `rollback(session_id=...)` to discard. After a schema \
+                     commit, THIS session can continue opening transactions on \
+                     `{db}` without re-reading schema; other sessions must call \
+                     `get_schema(session_id=..., database=\"{db}\")` again."
                 ),
             ),
         };
@@ -469,9 +468,10 @@ pub mod next_moves {
             v.insert(
                 0,
                 format!(
-                    "The schema-read gate for `{db}` was cleared by this commit. \
-                 Call `get_schema(session_id=..., database=\"{db}\")` again \
-                 before opening any transaction on it."
+                    "This session kept its schema-read gate for `{db}` because it \
+                 committed the schema change. Other sessions must call \
+                 `get_schema(session_id=..., database=\"{db}\")` again before \
+                 opening further transactions on that database."
                 ),
             );
         }
@@ -715,9 +715,10 @@ pub mod next_moves {
                  {moves:?}"
             );
             assert!(
-                joined.contains("clear the schema-read gate")
+                joined.contains("this session can continue opening transactions")
+                    && joined.contains("other sessions must call")
                     && joined.contains("get_schema(session_id=..., database=\"agents\")"),
-                "open_schema next_moves must warn schema commit clears the gate; got \
+                "open_schema next_moves must distinguish committer vs other-session schema gates; got \
                  {moves:?}"
             );
             assert!(

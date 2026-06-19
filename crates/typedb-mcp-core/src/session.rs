@@ -217,6 +217,19 @@ impl SessionStore {
             .collect()
     }
 
+    /// Clear the schema-read gate for `database` in every live session except
+    /// `except`. Used after a SCHEMA commit: the committing session already
+    /// knows the schema it just wrote, but all other sessions' schema snapshots
+    /// may now be stale.
+    pub async fn invalidate_schema_seen_except(&self, database: &str, except: &SessionId) {
+        for (id, arc) in self.all_sessions().await {
+            if &id == except {
+                continue;
+            }
+            arc.lock().await.schema_seen.remove(database);
+        }
+    }
+
     /// Remove a specific session from the store, returning its Arc if it
     /// existed. Used by the reaper after deciding a session is expired.
     pub async fn remove(&self, id: &SessionId) -> Option<Arc<Mutex<SessionState>>> {

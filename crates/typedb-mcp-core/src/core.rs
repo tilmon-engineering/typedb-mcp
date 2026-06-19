@@ -370,9 +370,9 @@ impl<'a> SessionHandle<'a> {
     }
 
     /// Run a closure inside a SCHEMA transaction. Same semantics as
-    /// [`with_write_tx`]. On successful commit of a schema tx, the
-    /// schema-read gate for the affected database is cleared per
-    /// invariant §3.6.
+    /// [`with_write_tx`]. On successful commit of a schema tx, this session
+    /// keeps its schema-read gate for the affected database because it knows
+    /// the schema it just wrote; other sessions are invalidated.
     pub async fn with_schema_tx<F, T>(
         &self,
         database: &str,
@@ -499,10 +499,13 @@ impl<'a> SessionHandle<'a> {
             Ok(TxOutcome::Commit(value)) => {
                 match tx.commit().await {
                     Ok(()) => {
-                        // Schema commit clears the gate for this db (§3.6).
+                        // The committing session knows the schema it just wrote; only
+                        // other sessions' schema snapshots are stale.
                         if matches!(kind, TxKind::Schema) {
-                            let mut s = self.arc.lock().await;
-                            s.schema_seen.remove(database);
+                            self.core
+                                .sessions
+                                .invalidate_schema_seen_except(database, &self.id)
+                                .await;
                         }
                         let json = serde_json::to_value(&value).unwrap_or(serde_json::Value::Null);
                         self.ok(json, hints_on_ok).await

@@ -651,12 +651,13 @@ async fn mcp_full_write_lifecycle() {
 }
 
 #[tokio::test]
-async fn mcp_schema_commit_clears_schema_gate_for_database() {
+async fn mcp_schema_commit_preserves_committer_gate_and_invalidates_other_sessions() {
     if !enabled() {
         return;
     }
     let (server_handle, client, _sessions) = connected_pair().await;
-    let sid = mint_sid(&client).await;
+    let sid_committer = mint_sid(&client).await;
+    let sid_other = mint_sid(&client).await;
 
     let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
         .await
@@ -667,17 +668,20 @@ async fn mcp_schema_commit_clears_schema_gate_for_database() {
     );
     setup.create_database(&db).await.unwrap();
 
-    let r = call(
-        &client,
-        "get_schema",
-        with_sid(&sid, serde_json::json!({"database": db})),
-    )
-    .await;
-    assert!(!is_error(&r), "get_schema should succeed: {r:?}");
+    for sid in [&sid_committer, &sid_other] {
+        let r = call(
+            &client,
+            "get_schema",
+            with_sid(sid, serde_json::json!({"database": db})),
+        )
+        .await;
+        assert!(!is_error(&r), "get_schema should succeed for {sid}: {r:?}");
+    }
+
     let r = call(
         &client,
         "open_schema",
-        with_sid(&sid, serde_json::json!({"database": db})),
+        with_sid(&sid_committer, serde_json::json!({"database": db})),
     )
     .await;
     assert!(!is_error(&r), "open_schema should succeed: {r:?}");
@@ -685,7 +689,7 @@ async fn mcp_schema_commit_clears_schema_gate_for_database() {
         &client,
         "query",
         with_sid(
-            &sid,
+            &sid_committer,
             serde_json::json!({
                 "query": "define attribute name, value string; entity widget, owns name @card(1..1);"
             }),
@@ -693,28 +697,50 @@ async fn mcp_schema_commit_clears_schema_gate_for_database() {
     )
     .await;
     assert!(!is_error(&r), "schema define should succeed: {r:?}");
-    let r = call(&client, "commit", with_sid(&sid, serde_json::Value::Null)).await;
+    let r = call(
+        &client,
+        "commit",
+        with_sid(&sid_committer, serde_json::Value::Null),
+    )
+    .await;
     assert!(!is_error(&r), "schema commit should succeed: {r:?}");
     let env = envelope(&r);
     assert_eq!(env["result"]["committed"], true);
     assert!(
-        !env["session"]["schema_seen_for"]
+        env["session"]["schema_seen_for"]
             .as_array()
             .expect("schema_seen_for array")
             .iter()
             .any(|seen| seen.as_str() == Some(&db)),
-        "schema commit should clear schema_seen for changed database"
+        "schema commit should preserve schema_seen for committing session"
     );
 
     let r = call(
         &client,
         "open_write",
-        with_sid(&sid, serde_json::json!({"database": db})),
+        with_sid(&sid_committer, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(
+        !is_error(&r),
+        "committing session should open_write after schema commit without re-reading schema: {r:?}"
+    );
+    let _ = call(
+        &client,
+        "rollback",
+        with_sid(&sid_committer, serde_json::Value::Null),
+    )
+    .await;
+
+    let r = call(
+        &client,
+        "open_write",
+        with_sid(&sid_other, serde_json::json!({"database": db})),
     )
     .await;
     assert!(
         is_error(&r),
-        "open_write after schema commit without re-reading schema should fail: {r:?}"
+        "other session should be forced to re-read schema after schema commit: {r:?}"
     );
     let env = envelope(&r);
     assert_eq!(env["error"]["class"], "SCHEMA_NOT_READ");
@@ -722,24 +748,24 @@ async fn mcp_schema_commit_clears_schema_gate_for_database() {
     let r = call(
         &client,
         "get_schema",
-        with_sid(&sid, serde_json::json!({"database": db})),
+        with_sid(&sid_other, serde_json::json!({"database": db})),
     )
     .await;
     assert!(
         !is_error(&r),
-        "get_schema after schema commit should succeed: {r:?}"
+        "other session get_schema after peer schema commit should succeed: {r:?}"
     );
     let r = call(
         &client,
         "open_write",
-        with_sid(&sid, serde_json::json!({"database": db})),
+        with_sid(&sid_other, serde_json::json!({"database": db})),
     )
     .await;
     assert!(
         !is_error(&r),
-        "open_write should succeed after re-reading schema: {r:?}"
+        "other session should open_write after re-reading schema: {r:?}"
     );
-    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    let _ = call(&client, "rollback", with_sid(&sid_other, serde_json::Value::Null)).await;
 
     setup.delete_database(&db).await.unwrap();
     drop(client);
