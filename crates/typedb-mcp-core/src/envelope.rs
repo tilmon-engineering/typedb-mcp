@@ -383,6 +383,9 @@ pub mod next_moves {
              TypeDB's write pipeline and fails will ABORT the transaction \
              automatically; you'll then need to open a new one."
                 .into(),
+            "If the work does not need to land atomically, commit periodically \
+             to checkpoint progress instead of risking a large rollback."
+                .into(),
             format!("Open transaction is on database `{db}`."),
         ]
     }
@@ -404,6 +407,9 @@ pub mod next_moves {
                      again before opening further transactions on it), or \
                      `rollback(session_id=...)` to discard."
             ),
+            "If the work does not need to land atomically, commit periodically \
+             to checkpoint progress instead of risking a large rollback."
+                .into(),
             format!("Open transaction is on database `{db}`."),
         ]
     }
@@ -657,6 +663,71 @@ pub mod next_moves {
                 joined.contains("tsv13") || joined.contains("transient"),
                 "TransientConflict next_moves should name the cause so the \
                  operator can recognize it on recurrence; got {moves:?}"
+            );
+        }
+
+        #[test]
+        fn after_open_write_next_moves_teach_write_lifecycle() {
+            let moves = after_open_write("agents");
+            let joined = moves.join(" ").to_lowercase();
+            assert!(
+                joined.contains("write transactions accept reads and data writes"),
+                "open_write next_moves must say WRITE txs allow reads plus data writes; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("commit(session_id=...)")
+                    && joined.contains("rollback(session_id=...)"),
+                "open_write next_moves must teach commit-or-rollback close paths; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("write pipeline") && joined.contains("abort"),
+                "open_write next_moves must warn write-pipeline failures abort the tx; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("checkpoint progress") && joined.contains("atomically"),
+                "open_write next_moves must coach periodic commits when atomicity is not needed; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("database `agents`"),
+                "open_write next_moves must identify the open database; got {moves:?}"
+            );
+        }
+
+        #[test]
+        fn after_open_schema_next_moves_teach_schema_write_lifecycle() {
+            let moves = after_open_schema("agents");
+            let joined = moves.join(" ").to_lowercase();
+            assert!(
+                joined.contains("schema transactions")
+                    && joined.contains("define")
+                    && joined.contains("data writes"),
+                "open_schema next_moves must say SCHEMA txs allow schema statements plus data writes; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("commit(session_id=...)")
+                    && joined.contains("rollback(session_id=...)"),
+                "open_schema next_moves must teach commit-or-rollback close paths; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("clear the schema-read gate")
+                    && joined.contains("get_schema(session_id=..., database=\"agents\")"),
+                "open_schema next_moves must warn schema commit clears the gate; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("checkpoint progress") && joined.contains("atomically"),
+                "open_schema next_moves must coach periodic commits when atomicity is not needed; got \
+                 {moves:?}"
+            );
+            assert!(
+                joined.contains("database `agents`"),
+                "open_schema next_moves must identify the open database; got {moves:?}"
             );
         }
     }

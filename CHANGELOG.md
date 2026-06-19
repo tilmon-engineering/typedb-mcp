@@ -17,6 +17,15 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-06-19
+
+### Changed
+
+- Successful `open_write` and `open_schema` responses now briefly coach agents
+  to commit periodically as checkpoints when the work does not need to land
+  atomically, reducing the risk of losing large batches of work to a later
+  abort or failed commit.
+
 ## [0.2.0] — 2026-06-18
 
 ### Added
