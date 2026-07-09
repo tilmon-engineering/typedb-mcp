@@ -201,6 +201,8 @@ pub fn explain_query_error(class: ErrorClass) -> String {
             "TypeQL parse error. Your transaction is still open — fix the query and retry.".into(),
         ErrorClass::TypeError =>
             "TypeQL type-inference error (e.g. unknown type label). Your transaction is still open — fix the query and retry.".into(),
+        ErrorClass::QueryFailed =>
+            "TypeQL query representation/execution-planning failed after parsing; TypeDB closed the transaction. Open a new transaction to continue.".into(),
         ErrorClass::WrongTxType =>
             "Wrong transaction kind for this query. Your transaction is still open; rollback and open the correct kind, or issue a different query.".into(),
         ErrorClass::WriteFailed =>
@@ -411,9 +413,9 @@ pub mod next_moves {
                      `{db}` without re-reading schema; other sessions must call \
                      `get_schema(session_id=..., database=\"{db}\")` again."
             ),
-            "On TypeDB 3.12+, include or update relevant `@doc` and `@meta` annotations in the same schema transaction as semantic schema changes. Useful `@meta` keys include `agent:usage`, `agent:example-read`, `agent:example-write`, `agent:common-mistake`, `agent:key-attribute`, `agent:role-constraints`, `agent:write-workflow`, and `agent:deprecation-note`."
+            "On TypeDB 3.12+, include or update relevant `@doc` and `@meta` annotations in the same schema transaction as semantic schema changes. Adding a new annotation to an existing schema element uses `define`; use `redefine` only to replace an existing annotation. Useful `@meta` keys include `agent:usage`, `agent:example-read`, `agent:example-write`, `agent:common-mistake`, `agent:key-attribute`, `agent:role-constraints`, `agent:write-workflow`, and `agent:deprecation-note`."
                 .into(),
-            "Prefer small conceptual schema layers. If more schema work remains and the work does not need to land atomically, use `checkpoint(session_id=...)` to commit this layer and immediately reopen a fresh SCHEMA transaction."
+            "Prefer small conceptual schema layers. If more schema work remains and the work does not need to land atomically, use `checkpoint(session_id=...)` to commit this layer and immediately reopen a fresh SCHEMA transaction. If this is the final layer, use `commit(session_id=...)` instead."
                 .into(),
             format!("Open transaction is on database `{db}`."),
         ]
@@ -477,7 +479,7 @@ pub mod next_moves {
                 "Checkpoint succeeded on `{db}` and a fresh {:?} transaction is already open. Continue with `query(session_id=..., query=...)`.",
                 kind
             ),
-            "When the next conceptual batch is complete, call `checkpoint(session_id=...)` again if more work remains, or final `commit(session_id=...)` to persist and close.".into(),
+            "When the next conceptual batch is complete, call `checkpoint(session_id=...)` again only if more work remains; otherwise use final `commit(session_id=...)` to persist and close without reopening another transaction.".into(),
         ];
         if matches!(kind, TxKind::Schema) {
             v.push(format!(
@@ -585,6 +587,14 @@ pub mod next_moves {
                 "Your transaction is still open. Fix the query and call \
                  `query(session_id=..., ...)` again, or \
                  `rollback(session_id=...)` to start over."
+                    .into(),
+            ],
+            QueryFailed => vec![
+                "The transaction has been closed by TypeDB after query representation or execution-planning failed. Open a new transaction before continuing."
+                    .into(),
+                "Avoid using reserved TypeQL root keywords such as `entity`, `relation`, or `attribute` as ordinary match targets or identifiers; prefer labels from `get_schema` or schema-defined abstract supertypes."
+                    .into(),
+                "If the failed query was schema-agnostic introspection, use `get_schema` for schema text and `isa! $t` plus `label($t)` for exact instance type labels."
                     .into(),
             ],
             WriteFailed => vec![

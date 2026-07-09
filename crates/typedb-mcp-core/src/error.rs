@@ -41,6 +41,10 @@ pub enum ErrorClass {
     /// Type inference / unknown label (maps `INF2 → QUA1 → QEX8 → TSV11`).
     /// **Recoverable**: tx is still open.
     TypeError,
+    /// Query representation / execution-planning failure after parsing (for
+    /// example reserved-keyword misuse or unbound variables in fetch
+    /// expressions). **Fatal** when TypeDB tears down the transaction.
+    QueryFailed,
     /// Write-pipeline failure (presence of `WEX1` / `PEX6` / `QEX14`).
     /// **Fatal**: tx is now gone.
     WriteFailed,
@@ -163,6 +167,24 @@ pub fn classify_typedb_error(top_code: &str, message: &str) -> ErrorClass {
     }
     if message.contains("[TSV7]") {
         return ErrorClass::ParseError;
+    }
+    if message.contains("[TSV10]") || message.contains("[QEX3]") || message.contains("[REX24]") {
+        // Failed schema execution aborts the schema transaction. REX24 is a
+        // representative case observed when `redefine` tries to replace an
+        // annotation category that does not yet exist; the remediation is to
+        // use `define` for adding annotations.
+        return ErrorClass::WriteFailed;
+    }
+    if message.contains("[REP27]")
+        || message.contains("[REP44]")
+        || message.contains("[FER7]")
+        || message.contains("[REP23]")
+        || message.contains("[QEX7]")
+    {
+        // Query representation / fetch-expression failures observed after
+        // parsing. Empirically these can close the transaction, so be
+        // conservative rather than marking them retriable.
+        return ErrorClass::QueryFailed;
     }
 
     // 3. Family prefixes — whole code families with one agent-facing class.
@@ -296,6 +318,36 @@ mod tests {
         );
         assert_eq!(c, ErrorClass::WrongTxType);
         assert!(c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn schema_redefine_missing_annotation_is_fatal_schema_execution() {
+        let c = classify_typedb_error(
+            "REX24",
+            "[REX24] Redefining annotation failed since there is no previously defined annotation of this category to replace. Try define instead?\n[QEX3] Failed to execute redefine query.\n[TSV10] Aborting transaction due to failed schema query.",
+        );
+        assert_eq!(c, ErrorClass::WriteFailed);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn representation_reserved_keyword_error_is_fatal_query_failed() {
+        let c = classify_typedb_error(
+            "REP27",
+            "[REP27] A reserved keyword 'entity' was used as identifier.\n[QEX7] Error in provided query.",
+        );
+        assert_eq!(c, ErrorClass::QueryFailed);
+        assert!(!c.retriable_in_same_tx());
+    }
+
+    #[test]
+    fn fetch_representation_unbound_variable_error_is_fatal_query_failed() {
+        let c = classify_typedb_error(
+            "REP44",
+            "[REP44] The variable 't' is required to be bound to a value before it's used.\n[FER7] Failed to convert fetch-expression.\n[REP23] Error building representation of fetch stage.\n[QEX7] Error in provided query.",
+        );
+        assert_eq!(c, ErrorClass::QueryFailed);
+        assert!(!c.retriable_in_same_tx());
     }
 
     // --- Family-prefix tests ---------------------------------------------
