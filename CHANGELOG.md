@@ -17,6 +17,8 @@ Scope notes:
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-09
+
 ### Added
 
 - Added the `checkpoint` raw tool. It commits the currently-open WRITE or
