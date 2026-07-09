@@ -17,6 +17,8 @@ Scope notes:
 
 ## [Unreleased]
 
+_No unreleased changes yet._
+
 ## [0.3.0] — 2026-07-09
 
 ### Added
