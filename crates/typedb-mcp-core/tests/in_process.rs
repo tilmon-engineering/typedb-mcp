@@ -620,7 +620,41 @@ async fn mcp_full_write_lifecycle() {
     assert_eq!(answers.len(), 1, "one widget visible inside the write tx");
     assert_eq!(answers[0]["name"], "first");
 
-    // 5. commit
+    // 5. checkpoint commits the first insert and immediately opens a fresh write tx.
+    let r = call(
+        &client,
+        "checkpoint",
+        with_sid(&sid, serde_json::Value::Null),
+    )
+    .await;
+    assert!(!is_error(&r), "checkpoint should succeed: {r:?}");
+    let env = envelope(&r);
+    assert_eq!(env["result"]["checkpointed"], true);
+    assert_eq!(env["result"]["committed"], true);
+    assert_eq!(env["result"]["reopened"], true);
+    assert_eq!(env["session"]["transaction"]["kind"], "write");
+    assert!(
+        env["next_moves"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m.as_str().unwrap().contains("checkpoint")),
+        "checkpoint next_moves mention checkpoint: {env:?}"
+    );
+
+    // 6. second insert happens in the fresh write tx.
+    let r = call(
+        &client,
+        "query",
+        with_sid(
+            &sid,
+            serde_json::json!({"query": "insert $w isa widget, has name \"second\";"}),
+        ),
+    )
+    .await;
+    assert!(!is_error(&r), "second insert should succeed: {r:?}");
+
+    // 7. final commit closes the fresh tx.
     let r = call(&client, "commit", with_sid(&sid, serde_json::Value::Null)).await;
     assert!(!is_error(&r), "commit should succeed: {r:?}");
     let env = envelope(&r);
@@ -630,7 +664,7 @@ async fn mcp_full_write_lifecycle() {
         "tx cleared on commit"
     );
 
-    // 6. read_once verifies persistence
+    // 8. read_once verifies both checkpointed and finally committed writes persisted.
     let r = call(
         &client,
         "read_once",
@@ -640,8 +674,12 @@ async fn mcp_full_write_lifecycle() {
     assert!(!is_error(&r), "read_once should succeed: {r:?}");
     let env = envelope(&r);
     let answers = env["result"]["answers"].as_array().expect("answers");
-    assert_eq!(answers.len(), 1);
-    assert_eq!(answers[0]["name"], "first");
+    let mut names = answers
+        .iter()
+        .map(|answer| answer["name"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec!["first".to_owned(), "second".to_owned()]);
 
     // Cleanup
     setup.delete_database(&db).await.unwrap();
@@ -765,8 +803,200 @@ async fn mcp_schema_commit_preserves_committer_gate_and_invalidates_other_sessio
         !is_error(&r),
         "other session should open_write after re-reading schema: {r:?}"
     );
-    let _ = call(&client, "rollback", with_sid(&sid_other, serde_json::Value::Null)).await;
+    let _ = call(
+        &client,
+        "rollback",
+        with_sid(&sid_other, serde_json::Value::Null),
+    )
+    .await;
 
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn mcp_checkpoint_without_open_tx_returns_no_tx_open() {
+    if !enabled() {
+        return;
+    }
+    let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
+
+    let r = call(
+        &client,
+        "checkpoint",
+        with_sid(&sid, serde_json::Value::Null),
+    )
+    .await;
+    assert!(is_error(&r), "checkpoint without tx should error: {r:?}");
+    let env = envelope(&r);
+    assert_eq!(env["error"]["class"], "NO_TX_OPEN");
+    assert!(env["session"]["transaction"].is_null());
+
+    drop(client);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn mcp_checkpoint_on_read_tx_returns_tx_is_read_and_leaves_tx_open() {
+    if !enabled() {
+        return;
+    }
+    let (server_handle, client, _sessions) = connected_pair().await;
+    let sid = mint_sid(&client).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!(
+        "mcp_checkpoint_read_{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    setup.create_database(&db).await.unwrap();
+
+    let _ = call(
+        &client,
+        "get_schema",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    let r = call(
+        &client,
+        "open_read",
+        with_sid(&sid, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "open_read should succeed: {r:?}");
+
+    let r = call(
+        &client,
+        "checkpoint",
+        with_sid(&sid, serde_json::Value::Null),
+    )
+    .await;
+    assert!(is_error(&r), "checkpoint on read should error: {r:?}");
+    let env = envelope(&r);
+    assert_eq!(env["error"]["class"], "TX_IS_READ");
+    assert_eq!(env["session"]["transaction"]["kind"], "read");
+    let moves = env["next_moves"].as_array().unwrap();
+    assert!(
+        moves
+            .iter()
+            .any(|m| m.as_str().unwrap().contains("rollback")),
+        "read checkpoint error next_moves mention rollback: {moves:?}"
+    );
+
+    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    setup.delete_database(&db).await.unwrap();
+    drop(client);
+    let _ = server_handle.await;
+}
+
+#[tokio::test]
+async fn mcp_schema_checkpoint_reopens_and_invalidates_other_sessions() {
+    if !enabled() {
+        return;
+    }
+    let (server_handle, client, _sessions) = connected_pair().await;
+    let sid_committer = mint_sid(&client).await;
+    let sid_other = mint_sid(&client).await;
+
+    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
+        .await
+        .unwrap();
+    let db = format!(
+        "mcp_schema_checkpoint_{}",
+        &uuid::Uuid::new_v4().to_string()[..8]
+    );
+    setup.create_database(&db).await.unwrap();
+
+    for sid in [&sid_committer, &sid_other] {
+        let r = call(
+            &client,
+            "get_schema",
+            with_sid(sid, serde_json::json!({"database": db})),
+        )
+        .await;
+        assert!(!is_error(&r), "get_schema should succeed for {sid}: {r:?}");
+    }
+
+    let r = call(
+        &client,
+        "open_schema",
+        with_sid(&sid_committer, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(!is_error(&r), "open_schema should succeed: {r:?}");
+    let r = call(
+        &client,
+        "query",
+        with_sid(
+            &sid_committer,
+            serde_json::json!({
+                "query": "define attribute title @doc(\"Human-readable title.\") @meta(\"agent:usage\", \"Use as a display label.\"), value string; entity note @doc(\"A note entity.\"), owns title @card(1..1) @doc(\"Each note has exactly one title.\");"
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        !is_error(&r),
+        "annotated schema define should succeed: {r:?}"
+    );
+
+    let r = call(
+        &client,
+        "checkpoint",
+        with_sid(&sid_committer, serde_json::Value::Null),
+    )
+    .await;
+    assert!(!is_error(&r), "schema checkpoint should succeed: {r:?}");
+    let env = envelope(&r);
+    assert_eq!(env["result"]["checkpointed"], true);
+    assert_eq!(env["session"]["transaction"]["kind"], "schema");
+    assert!(
+        env["session"]["schema_seen_for"]
+            .as_array()
+            .expect("schema_seen_for array")
+            .iter()
+            .any(|seen| seen.as_str() == Some(&db)),
+        "schema checkpoint should preserve schema_seen for committing session"
+    );
+
+    let r = call(
+        &client,
+        "open_write",
+        with_sid(&sid_other, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(
+        is_error(&r),
+        "other session should be forced to re-read schema after schema checkpoint: {r:?}"
+    );
+    let env = envelope(&r);
+    assert_eq!(env["error"]["class"], "SCHEMA_NOT_READ");
+
+    let r = call(
+        &client,
+        "get_schema",
+        with_sid(&sid_committer, serde_json::json!({"database": db})),
+    )
+    .await;
+    assert!(
+        !is_error(&r),
+        "committer get_schema after checkpoint should succeed: {r:?}"
+    );
+    let env = envelope(&r);
+    let schema = env["result"]["schema"].as_str().expect("schema string");
+    assert!(schema.contains("@doc") || env["result"]["metadata"]["included_in_schema"] == true);
+    assert_eq!(env["result"]["schema_metadata_supported"], true);
+
+    let _ = call(
+        &client,
+        "rollback",
+        with_sid(&sid_committer, serde_json::Value::Null),
+    )
+    .await;
     setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;

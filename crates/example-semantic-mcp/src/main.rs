@@ -17,8 +17,8 @@
 //!      entity id" string. Demonstrates the typemap (DESIGN.md §3a).
 //! 3. Merges [`tools::raw_tools_router`] into its own
 //!    [`rmcp::handler::server::router::tool::ToolRouter`] so the agent
-//!    sees both the ten raw tools and the two semantic tools through a
-//!    single handler.
+//!    sees both the eleven raw tools (including `checkpoint`) and the three
+//!    semantic tools through a single handler.
 //!
 //! Run with the same `TYPEDB_MCP_CONFIG` env var the binary uses, e.g.
 //! `TYPEDB_MCP_CONFIG=config.local.toml cargo run -p example-semantic-mcp`.
@@ -60,7 +60,7 @@ struct ExampleMcp {
 
 impl ExampleMcp {
     fn new(core: Arc<TypeDbCore>) -> Self {
-        // Mount the ten raw tools generic over `Self`.
+        // Mount the eleven raw tools generic over `Self`.
         let mut tool_router = tools::raw_tools_router::<Self>(tools::RawToolsConfig::default());
         // Merge our own semantic tools onto the same router. Both halves
         // dispatch into the same `Self` so they can share state.
@@ -215,10 +215,10 @@ impl ServerHandler for ExampleMcp {
         let mut info = ServerInfo::default();
         info.instructions = Some(
             "Example MCP server demonstrating typedb-mcp-core library use. \
-             Exposes the standard ten typedb tools (start_session, get_schema, \
-             open_*, query, commit, rollback, read_once, list_databases) plus \
-             three semantic tools: count_entities, current_focus, set_focus. \
-             Call `start_session` first."
+             Exposes the standard eleven typedb tools (start_session, get_schema, \
+             open_*, query, checkpoint, commit, rollback, read_once, \
+             list_databases) plus three semantic tools: count_entities, \
+             current_focus, set_focus. Call `start_session` first."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();

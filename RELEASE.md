@@ -30,7 +30,7 @@ pre-release responsibility (see step 1).
   `Cargo.toml`. All three crates inherit it via `version.workspace = true`.
 - This project uses SemVer for the container image and the in-repo Rust
   packages. The contract surface is defined in `CHANGELOG.md`'s scope notes:
-  the ten default agent-facing tools (`DESIGN.md` §7), any explicitly enabled
+  the eleven default agent-facing tools (`DESIGN.md` §7), any explicitly enabled
   built-in tool surfaces, the response envelope, the transaction state machine,
   deployment/runtime compatibility promises, and the `typedb-mcp-core` public
   re-exports (`DESIGN.md` §11).
@@ -54,7 +54,7 @@ pre-release responsibility (see step 1).
 ## Cutting a release
 
 1. **Green tests, locally.** CI does not run tests, so this gate is on
-   you. From the workspace root, with a live TypeDB 3.11+ on
+   you. From the workspace root, with a live TypeDB 3.12+ on
    `127.0.0.1:1729` (credentials `admin`/`password`):
 
    ```bash
@@ -63,8 +63,8 @@ pre-release responsibility (see step 1).
 
    All units, the in-process MCP suite, and the driver-level smoke
    tests must pass. (Note: the local server must be reachable by the
-   rust driver — TypeDB CE 3.11.5+ standalone servers need
-   typedb-driver ≥ 3.11.5; see CHANGELOG 0.1.3.)
+   rust driver and must be TypeDB 3.12+ for schema annotation metadata;
+   older 3.x servers are outside the supported floor.)
 
 2. **Update `CHANGELOG.md`.** Move the `[Unreleased]` content into a new
    `## [X.Y.Z] — YYYY-MM-DD` section, leaving an empty `[Unreleased]`

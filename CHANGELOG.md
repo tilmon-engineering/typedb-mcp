@@ -8,7 +8,7 @@ The release process is documented in `RELEASE.md`.
 
 Scope notes:
 
-- Changes to the ten agent-facing tools (`DESIGN.md` §7), the response
+- Changes to the eleven agent-facing tools (`DESIGN.md` §7), the response
   envelope, the transaction state machine, or the `typedb-mcp-core`
   public re-exports (`DESIGN.md` §11) are **contract changes** and must
   appear here.
@@ -16,6 +16,27 @@ Scope notes:
   briefly or omitted.
 
 ## [Unreleased]
+
+### Added
+
+- Added the `checkpoint` raw tool. It commits the currently-open WRITE or
+  SCHEMA transaction and immediately opens a fresh transaction of the same
+  kind on the same database when reopening succeeds.
+- `get_schema` now returns an explicit TypeDB 3.12 schema-metadata contract
+  alongside the schema so agents know how `@doc`/`@meta` annotations are
+  exposed and how to treat them safely.
+
+### Changed
+
+- Minimum supported TypeDB/`typedb-driver` version is now 3.12+; schema
+  annotation metadata is load-bearing for the reference server contract.
+- The default non-admin raw tool surface is now eleven tools:
+  `start_session`, `list_databases`, `get_schema`, `open_read`,
+  `open_write`, `open_schema`, `query`, `checkpoint`, `commit`, `rollback`,
+  and `read_once`.
+- Write/schema tool descriptions and `next_moves` now coach agents to use
+  smaller conceptual batches and `checkpoint` when more work remains, while
+  reserving final `commit` for closing a unit of work.
 
 ## [0.2.2] — 2026-06-19
 

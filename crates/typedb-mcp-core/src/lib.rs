@@ -2,7 +2,7 @@
 //!
 //! Two kinds of consumer:
 //!
-//! 1. **The reference binary** (`typedb-mcp`): mounts the ten default raw
+//! 1. **The reference binary** (`typedb-mcp`): mounts the eleven default raw
 //!    tools via the [`tools`] router, plus optional database-admin tools
 //!    only when explicitly enabled by operator config.
 //! 2. **Other MCP servers** that want to embed TypeDB safety semantics

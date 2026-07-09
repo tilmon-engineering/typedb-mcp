@@ -9,7 +9,7 @@
 //! 2. Serve as a worked example of a `HasTypeDbCore` implementation
 //!    that library consumers can crib from.
 //!
-//! The default ten raw tools, plus explicitly enabled optional admin
+//! The default eleven raw tools, plus explicitly enabled optional admin
 //! tools, live in [`crate::tools`] — see DESIGN.md §11 for the library
 //! extension API.
 

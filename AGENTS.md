@@ -9,9 +9,10 @@ library API; new public extension API — `TypeDbCore`, `HasTypeDbCore`,
 and the full `envelope` module — see `DESIGN.md` §11).
 
 A safety-focused MCP server, written in Rust, that exposes a TypeDB
-3.11+ database to an LLM agent through a connection-bound transaction
-model. **TypeDB 3.10.x and earlier are not supported** — deployment
-against pre-3.11 servers fails at the driver layer.
+3.12+ database to an LLM agent through a connection-bound transaction
+model. **TypeDB releases before 3.12 are not supported** — schema
+annotation metadata (`@doc` / `@meta`) is load-bearing for agent-safe
+modeling.
 
 ## Where this project sits in the OST graph
 
@@ -122,7 +123,7 @@ shared `[workspace.dependencies]`). Three members:
 
 - `crates/typedb-mcp-core/` — the library kernel. Owns `config`,
   `core`, `envelope`, `error`, `extensions`, `handler`, `session`,
-  `tools`, `typedb`. Public re-exports in `lib.rs`. The ten raw tools
+  `tools`, `typedb`. Public re-exports in `lib.rs`. The eleven raw tools
   live in `tools::*` as free generic `fn`s over `H: HasTypeDbCore`
   (not closures — see "rmcp gotchas" below) and are assembled by
   `tools::raw_tools_router::<H>(RawToolsConfig)`. `handler.rs` is an
@@ -169,10 +170,11 @@ helpers; `TxOutcome::{Commit, Rollback}` for write/schema closures;
   `crates/typedb-mcp-core/reference/`, `crates/typedb-mcp/src/`,
   `crates/example-semantic-mcp/src/`, `DESIGN.md`, `AGENTS.md`, root
   and per-crate `Cargo.toml`.
-- The ten tools enumerated in `DESIGN.md` §7.0-§7.9 (`start_session` plus
-  the nine TypeDB-facing tools) are the default agent-facing surface of the
-  reference binary. The only built-in extra tools are the optional database
-  admin tools in §7.10-§7.11, absent unless explicitly enabled by operator
+- The eleven tools enumerated in `DESIGN.md` §7.0-§7.10 (`start_session`,
+  `list_databases`, `get_schema`, `open_read`, `open_write`, `open_schema`,
+  `query`, `checkpoint`, `commit`, `rollback`, `read_once`) are the default
+  agent-facing surface of the reference binary. The only built-in extra tools are the optional database
+  admin tools in §7.11-§7.12, absent unless explicitly enabled by operator
   config. Adding any other tool is a design change, not an implementation
   change — update `DESIGN.md` first. (Library consumers may of course add
   their own semantic tools alongside.)
