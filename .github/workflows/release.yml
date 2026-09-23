@@ -139,7 +139,7 @@ jobs:
             typedb-mcp-aarch64-apple-darwin.tar.gz \
             typedb-mcp-x86_64-apple-darwin.tar.gz \
             SHA256SUMS; do
-            gh api "${api}/${release_id}/assets" > existing-assets.json
+            gh api "${api}/${release_id}/assets" --paginate --slurp | jq -c 'add' > existing-assets.json
             reuse_existing="$(python3 scripts/check_existing_release_asset.py existing-assets.json "${asset_name}" "release-assets/${asset_name}")"
             if [[ "${reuse_existing}" == "yes" ]]; then
               echo "verified existing asset ${asset_name}; resuming upload"
