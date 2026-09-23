@@ -29,7 +29,7 @@ use rmcp::{
 
 use crate::{
     config::Config,
-    core::{HasTypeDbCore, TypeDbCore},
+    core::{ExecutionContext, HasTypeDbCore, TypeDbCore},
     language_reference::TYPEQL_LANGUAGE_REFERENCE,
     session::SessionStore,
     tools::{RawToolsConfig, raw_tools_router},
@@ -39,6 +39,7 @@ use crate::{
 #[derive(Clone)]
 pub struct TypeDbMcp {
     pub core: Arc<TypeDbCore>,
+    context: ExecutionContext,
     pub tool_router: ToolRouter<Self>,
     pub prompt_router: PromptRouter<Self>,
 }
@@ -58,15 +59,30 @@ impl TypeDbMcp {
     /// kernel use this; consumers writing their own handler implement
     /// [`HasTypeDbCore`] on it directly.
     pub fn from_core(core: Arc<TypeDbCore>) -> Self {
+        Self::from_core_with_context(core, ExecutionContext::Unspecified)
+    }
+
+    pub fn from_core_with_context(core: Arc<TypeDbCore>, context: ExecutionContext) -> Self {
         let raw_cfg = RawToolsConfig::default()
-            .with_database_admin_tools(core.config.server.enable_database_admin_tools);
+            .with_database_admin_tools(core.config.server.enable_database_admin_tools)
+            .with_database_migration_tools(core.config.server.enable_database_migration_tools)
+            .with_execution_context(context);
         let tool_router = raw_tools_router::<Self>(raw_cfg);
         let prompt_router = Self::prompt_router();
         Self {
             core,
+            context,
             tool_router,
             prompt_router,
         }
+    }
+
+    pub fn for_stdio(core: Arc<TypeDbCore>) -> Self {
+        Self::from_core_with_context(core, ExecutionContext::Stdio)
+    }
+
+    pub fn for_http(core: Arc<TypeDbCore>) -> Self {
+        Self::from_core_with_context(core, ExecutionContext::Http)
     }
 }
 
@@ -88,6 +104,10 @@ impl TypeDbMcp {
 impl HasTypeDbCore for TypeDbMcp {
     fn typedb_core(&self) -> &Arc<TypeDbCore> {
         &self.core
+    }
+
+    fn execution_context(&self) -> ExecutionContext {
+        self.context
     }
 }
 

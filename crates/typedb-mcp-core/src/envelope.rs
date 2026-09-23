@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Public agent-facing response envelope. See DESIGN.md §6 and §6.1.
 //!
 //! Every tool response — raw or consumer-defined — must carry the same

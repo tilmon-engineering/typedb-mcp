@@ -17,8 +17,11 @@
 //!      entity id" string. Demonstrates the typemap (DESIGN.md §3a).
 //! 3. Merges [`tools::raw_tools_router`] into its own
 //!    [`rmcp::handler::server::router::tool::ToolRouter`] so the agent
-//!    sees both the eleven raw tools (including `checkpoint`) and the three
-//!    semantic tools through a single handler.
+//!    sees all twelve default raw tools (including `server_info` and
+//!    `checkpoint`) and the three semantic tools through a single handler.
+//!    The optional database-migration family is deliberately a separate,
+//!    explicit opt-in (`with_database_migration_tools(true)`) and is not
+//!    mounted by this example.
 //!
 //! Run with the same `TYPEDB_MCP_CONFIG` env var the binary uses, e.g.
 //! `TYPEDB_MCP_CONFIG=config.local.toml cargo run -p example-semantic-mcp`.
@@ -60,8 +63,12 @@ struct ExampleMcp {
 
 impl ExampleMcp {
     fn new(core: Arc<TypeDbCore>) -> Self {
-        // Mount the eleven raw tools generic over `Self`.
-        let mut tool_router = tools::raw_tools_router::<Self>(tools::RawToolsConfig::default());
+        // Explicit stdio composition: mount the twelve default raw tools.
+        // Migration tools remain a separate opt-in family and are omitted.
+        let raw_config = tools::RawToolsConfig::default()
+            .with_execution_context(typedb_mcp_core::ExecutionContext::Stdio)
+            .with_database_migration_tools(false);
+        let mut tool_router = tools::raw_tools_router::<Self>(raw_config);
         // Merge our own semantic tools onto the same router. Both halves
         // dispatch into the same `Self` so they can share state.
         tool_router.merge(Self::semantic_router());
@@ -144,7 +151,7 @@ impl ExampleMcp {
         ]);
         Ok(session
             .with_read_tx(&database, hints, async |tx| {
-                let answer = tx.query(&typeql).await.map_err(InternalError::Driver)?;
+                let answer = tx.query(&typeql).await.map_err(InternalError::from)?;
                 let json = typedb_mcp_core::query_answer_to_json(answer, 10).await?;
                 Ok(serde_json::json!({
                     "entity_type": entity_type,
@@ -215,10 +222,10 @@ impl ServerHandler for ExampleMcp {
         let mut info = ServerInfo::default();
         info.instructions = Some(
             "Example MCP server demonstrating typedb-mcp-core library use. \
-             Exposes the standard eleven typedb tools (start_session, get_schema, \
-             open_*, query, checkpoint, commit, rollback, read_once, \
-             list_databases) plus three semantic tools: count_entities, \
-             current_focus, set_focus. Call `start_session` first."
+             Exposes the standard twelve typedb tools (including server_info) \
+             plus three semantic tools: count_entities, current_focus, set_focus. \
+             Database migration tools are a separate explicit opt-in family. \
+             Call `start_session` first."
                 .to_owned(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();

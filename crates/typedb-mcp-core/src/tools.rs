@@ -1,4 +1,4 @@
-//! Generic raw tool router — exposes the eleven default tools enumerated in
+//! Generic raw tool router — exposes the twelve default tools enumerated in
 //! DESIGN.md §7, plus optional database-admin tools when explicitly enabled,
 //! against any handler type `H: HasTypeDbCore`.
 //!
@@ -106,6 +106,22 @@ pub struct DeleteDatabaseParams {
     pub confirm_database: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExportDatabaseParams {
+    pub session_id: String,
+    pub database: String,
+    pub schema_file_path: String,
+    pub data_file_path: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ImportDatabaseParams {
+    pub session_id: String,
+    pub database: String,
+    pub schema_file_path: String,
+    pub data_file_path: String,
+    pub confirm_database: String,
+}
+
 // ---------- canonical tool descriptions ----------------------------------
 
 const DESC_START_SESSION: &str = "\
@@ -202,6 +218,10 @@ is opened, the query is run, and the transaction is closed atomically. \
 Requires prior `get_schema(database)`. Result is capped (see config); \
 paginate with `sort $k; offset N; limit M;`.";
 
+const DESC_SERVER_INFO: &str = "\
+Return bounded, read-only server and connectivity information. Requires a valid \
+`session_id`; this does not open, commit, or alter a transaction.";
+
 const DESC_CREATE_DATABASE: &str = "\
 Create a database on the TypeDB server. This admin tool is disabled unless \
 the operator explicitly enables database admin tools in server config. \
@@ -230,6 +250,9 @@ pub mod names {
     pub const COMMIT: &str = "commit";
     pub const ROLLBACK: &str = "rollback";
     pub const READ_ONCE: &str = "read_once";
+    pub const SERVER_INFO: &str = "server_info";
+    pub const EXPORT_DATABASE: &str = "export_database";
+    pub const IMPORT_DATABASE: &str = "import_database";
     pub const CREATE_DATABASE: &str = "create_database";
     pub const DELETE_DATABASE: &str = "delete_database";
 
@@ -247,6 +270,7 @@ pub mod names {
         COMMIT,
         ROLLBACK,
         READ_ONCE,
+        SERVER_INFO,
     ];
 }
 
@@ -258,6 +282,8 @@ pub struct RawToolsConfig {
     prefix: Option<String>,
     omit: HashSet<String>,
     include_database_admin: bool,
+    execution_context: crate::core::ExecutionContext,
+    include_database_migration: bool,
 }
 
 impl RawToolsConfig {
@@ -275,6 +301,19 @@ impl RawToolsConfig {
     /// because `delete_database` is destructive.
     pub fn with_database_admin_tools(mut self, enabled: bool) -> Self {
         self.include_database_admin = enabled;
+        self
+    }
+
+    /// Set the immutable transport authority used for gated routes.
+    pub fn with_execution_context(mut self, context: crate::core::ExecutionContext) -> Self {
+        self.execution_context = context;
+        self
+    }
+
+    /// Include stdio-only database migration routes. The handler still checks
+    /// both this policy and its own immutable context at invocation time.
+    pub fn with_database_migration_tools(mut self, enabled: bool) -> Self {
+        self.include_database_migration = enabled;
         self
     }
 
@@ -302,7 +341,7 @@ impl RawToolsConfig {
 
 // ---------- the router builder -------------------------------------------
 
-/// Build a [`ToolRouter`] carrying the default eleven raw TypeDB tools, plus
+/// Build a [`ToolRouter`] carrying the default twelve raw TypeDB tools, plus
 /// optional database-admin tools when explicitly enabled, generic over any
 /// handler type `H: HasTypeDbCore`.
 pub fn raw_tools_router<H>(config: RawToolsConfig) -> ToolRouter<H>
@@ -375,6 +414,34 @@ where
             tool_with::<ReadOnceParams>(name, DESC_READ_ONCE),
             handler_read_once::<H>,
         ));
+    }
+    if let Some(name) = config.resolve_name(names::SERVER_INFO) {
+        router.add_route(ToolRoute::new(
+            tool_with::<SessionOnlyParams>(name, DESC_SERVER_INFO),
+            handler_server_info::<H>,
+        ));
+    }
+    if config.include_database_migration
+        && matches!(
+            config.execution_context,
+            crate::core::ExecutionContext::Stdio
+        )
+    {
+        if let Some(name) = config.resolve_name(names::EXPORT_DATABASE) {
+            router.add_route(ToolRoute::new(
+                tool_with::<ExportDatabaseParams>(name, "Export a database to new absolute files."),
+                handler_export_database::<H>,
+            ));
+        }
+        if let Some(name) = config.resolve_name(names::IMPORT_DATABASE) {
+            router.add_route(ToolRoute::new(
+                tool_with::<ImportDatabaseParams>(
+                    name,
+                    "Import a database from validated absolute files into a new target.",
+                ),
+                handler_import_database::<H>,
+            ));
+        }
     }
     if config.include_database_admin {
         if let Some(name) = config.resolve_name(names::CREATE_DATABASE) {
@@ -505,6 +572,58 @@ fn handler_read_once<H: HasTypeDbCore>(
     Box::pin(async move { Ok(do_read_once(&core, p).await) })
 }
 
+fn handler_server_info<H: HasTypeDbCore>(
+    service: &H,
+    Parameters(p): Parameters<SessionOnlyParams>,
+) -> ToolFut<'_> {
+    let core = service.typedb_core().clone();
+    let context = service.execution_context();
+    Box::pin(async move { Ok(do_server_info(&core, context, p).await) })
+}
+
+fn handler_export_database<H: HasTypeDbCore>(
+    service: &H,
+    Parameters(p): Parameters<ExportDatabaseParams>,
+) -> ToolFut<'_> {
+    let core = service.typedb_core().clone();
+    let allowed = service.execution_context() == crate::core::ExecutionContext::Stdio
+        && core.config.server.enable_database_migration_tools;
+    Box::pin(async move {
+        Ok(do_migration(
+            &core,
+            allowed,
+            crate::migration::MigrationKind::Export,
+            p.session_id,
+            p.database,
+            p.schema_file_path,
+            p.data_file_path,
+            None,
+        )
+        .await)
+    })
+}
+fn handler_import_database<H: HasTypeDbCore>(
+    service: &H,
+    Parameters(p): Parameters<ImportDatabaseParams>,
+) -> ToolFut<'_> {
+    let core = service.typedb_core().clone();
+    let allowed = service.execution_context() == crate::core::ExecutionContext::Stdio
+        && core.config.server.enable_database_migration_tools;
+    Box::pin(async move {
+        Ok(do_migration(
+            &core,
+            allowed,
+            crate::migration::MigrationKind::Import,
+            p.session_id,
+            p.database,
+            p.schema_file_path,
+            p.data_file_path,
+            Some(p.confirm_database),
+        )
+        .await)
+    })
+}
+
 fn handler_create_database<H: HasTypeDbCore>(
     service: &H,
     Parameters(p): Parameters<CreateDatabaseParams>,
@@ -567,6 +686,139 @@ async fn do_start_session(core: &TypeDbCore) -> CallToolResult {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn do_migration(
+    core: &TypeDbCore,
+    allowed: bool,
+    kind: crate::migration::MigrationKind,
+    sid: String,
+    database: String,
+    schema: String,
+    data: String,
+    confirm: Option<String>,
+) -> CallToolResult {
+    if !allowed {
+        return crate::envelope::envelope_state_error_no_session(
+            crate::error::ErrorClass::Unclassified,
+            "Database migration tools are available only on explicitly configured stdio handlers.",
+            next_moves::on_upstream_unavailable(),
+        );
+    }
+    let session = match core.resolve(&sid).await {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    if let Some(c) = confirm
+        && c != database
+    {
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::ConfirmationRequired,
+            "Import requires exact database confirmation.",
+            next_moves::on_error(ErrorClass::ConfirmationRequired, Some(&database)),
+        );
+    }
+    let guard = session.arc().clone().lock_owned().await;
+    if guard.tx.is_some() {
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::TxAlreadyOpen,
+            "Close the caller transaction before migration.",
+            next_moves::on_error(ErrorClass::TxAlreadyOpen, Some(&database)),
+        );
+    }
+    let rx = match core
+        .migration_supervisor
+        .submit(
+            kind,
+            database.clone(),
+            std::path::PathBuf::from(schema),
+            std::path::PathBuf::from(data),
+            guard,
+        )
+        .await
+    {
+        Ok(rx) => rx,
+        Err(e) => {
+            return envelope_state_error(
+                session.snapshot().await,
+                ErrorClass::Unclassified,
+                &e.to_string(),
+                next_moves::on_upstream_unavailable(),
+            );
+        }
+    };
+    match rx.await {
+        Ok(Ok(report)) => {
+            if kind == crate::migration::MigrationKind::Import {
+                core.sessions
+                    .invalidate_schema_seen_except(&database, session.id())
+                    .await;
+            }
+            envelope_ok(
+                session.snapshot().await,
+                serde_json::json!({"database":database,"kind":format!("{:?}",report.kind),"status":format!("{:?}",report.status),"manifest":{"schema_size":report.manifest.schema_size,"data_size":report.manifest.data_size,"schema_sha256":report.manifest.schema_sha256,"data_sha256":report.manifest.data_sha256},"published":report.published}),
+                next_moves::after_get_schema(&database),
+            )
+        }
+        Ok(Err(e)) => envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::Unclassified,
+            &e.to_string(),
+            next_moves::on_upstream_unavailable(),
+        ),
+        Err(_) => envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::Unclassified,
+            "Migration worker ended before reporting completion.",
+            next_moves::on_upstream_unavailable(),
+        ),
+    }
+}
+
+async fn do_server_info(
+    core: &TypeDbCore,
+    context: crate::core::ExecutionContext,
+    p: SessionOnlyParams,
+) -> CallToolResult {
+    let session = match core.resolve(&p.session_id).await {
+        Ok(s) => s,
+        Err(env) => return env,
+    };
+    let snap = session.snapshot().await;
+    let diagnostic = core
+        .typedb
+        .diagnostics(
+            std::time::Duration::from_secs(core.config.typedb.request_timeout_s.unwrap_or(30)),
+            core.config.server.expose_connection_details
+                && matches!(
+                    context,
+                    crate::core::ExecutionContext::Stdio | crate::core::ExecutionContext::Http
+                ),
+        )
+        .await;
+    match diagnostic {
+        Ok(report) => envelope_ok(
+            snap,
+            serde_json::json!({
+                "mcp": { "version": env!("CARGO_PKG_VERSION") },
+                "typedb": { "distribution": report.version.distribution, "server_version": report.version.version, "version_status": report.version.status, "driver_version": crate::connection::DRIVER_VERSION, "support_floor": crate::connection::SUPPORTED_SERVER_FLOOR },
+                "transport": { "execution_context": format!("{:?}", context), "enabled_tool_families": { "default": true, "admin": core.config.server.enable_database_admin_tools, "migration": core.config.server.enable_database_migration_tools && matches!(context, crate::core::ExecutionContext::Stdio) } },
+                "connectivity": report.connectivity,
+                "topology": report.topology,
+                "topology_error": report.topology_error,
+            }),
+            next_moves::after_list_databases(),
+        ),
+        Err(e) => envelope_err(
+            snap,
+            e,
+            "Could not complete bounded server diagnostics.",
+            next_moves::on_upstream_unavailable(),
+        ),
+    }
+}
+
 async fn do_list_databases(core: &TypeDbCore, p: SessionOnlyParams) -> CallToolResult {
     let session = match core.resolve(&p.session_id).await {
         Ok(s) => s,
@@ -618,7 +870,20 @@ async fn do_create_database(core: &TypeDbCore, p: CreateDatabaseParams) -> CallT
         );
     }
     drop(state);
-    match core.typedb.create_database(&p.database).await {
+    let reservation = match core.coordinator.try_reserve(&p.database) {
+        Ok(r) => r,
+        Err(_) => {
+            return envelope_state_error(
+                session.snapshot().await,
+                ErrorClass::Unclassified,
+                "Database operation is busy; retry later.",
+                next_moves::on_upstream_unavailable(),
+            );
+        }
+    };
+    let result = core.typedb.create_database(&p.database).await;
+    drop(reservation);
+    match result {
         Ok(()) => envelope_ok(
             session.snapshot().await,
             serde_json::json!({ "created": true, "database": p.database }),
@@ -690,7 +955,20 @@ async fn do_delete_database(core: &TypeDbCore, p: DeleteDatabaseParams) -> CallT
             );
         }
     }
-    match core.typedb.delete_database(&p.database).await {
+    let reservation = match core.coordinator.try_reserve(&p.database) {
+        Ok(r) => r,
+        Err(_) => {
+            return envelope_state_error(
+                session.snapshot().await,
+                ErrorClass::Unclassified,
+                "Database operation is busy; retry later.",
+                next_moves::on_upstream_unavailable(),
+            );
+        }
+    };
+    let result = core.typedb.delete_database(&p.database).await;
+    drop(reservation);
+    match result {
         Ok(()) => {
             let sessions = core.sessions.all_sessions().await;
             for (_sid, arc) in sessions {
@@ -779,6 +1057,15 @@ async fn do_open_any(
     };
     let arc = session.arc().clone();
     let mut state = arc.lock().await;
+    if core.coordinator.is_reserved(&p.database) {
+        drop(state);
+        return envelope_state_error(
+            session.snapshot().await,
+            ErrorClass::Unclassified,
+            "Database operation is busy; retry later.",
+            next_moves::on_upstream_unavailable(),
+        );
+    }
     if state.tx.is_some() {
         drop(state);
         return envelope_state_error(
@@ -887,7 +1174,7 @@ async fn do_query(core: &TypeDbCore, p: SessionAndQueryParams) -> CallToolResult
             }
         },
         Err(e) => {
-            let internal = InternalError::Driver(e);
+            let internal = InternalError::from(e);
             let class = internal.to_class();
             if !class.retriable_in_same_tx() {
                 state.tx = None;
@@ -934,7 +1221,7 @@ async fn do_checkpoint(core: &TypeDbCore, p: SessionOnlyParams) -> CallToolResul
     let kind = owned.kind;
     let commit_result = owned.transaction.commit().await;
     if let Err(e) = commit_result {
-        let internal = InternalError::Driver(e);
+        let internal = InternalError::from(e);
         let class = internal.to_class();
         drop(state);
         return envelope_err(
@@ -1029,7 +1316,7 @@ async fn do_commit(core: &TypeDbCore, p: SessionOnlyParams) -> CallToolResult {
             )
         }
         Err(e) => {
-            let internal = InternalError::Driver(e);
+            let internal = InternalError::from(e);
             let class = internal.to_class();
             drop(state);
             envelope_err(
@@ -1125,7 +1412,7 @@ async fn do_read_once(core: &TypeDbCore, p: ReadOnceParams) -> CallToolResult {
     // close aborts with TSV13 (self-inflicted, not a concurrent conflict).
     let json_result = match tx.query(&p.query).await {
         Ok(answer) => query_answer_to_json(answer, result_cap).await,
-        Err(e) => Err(InternalError::Driver(e)),
+        Err(e) => Err(InternalError::from(e)),
     };
     if let Err(e) = tx.close().await {
         tracing::warn!(error = %e, "read_once close returned an error");

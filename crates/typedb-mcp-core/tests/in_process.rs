@@ -29,11 +29,12 @@ use typedb_mcp_core::{
     },
     session::SessionStore,
     tools,
-    typedb::TypeDbClient,
 };
 
+mod common;
+
 fn enabled() -> bool {
-    std::env::var("TYPEDB_MCP_SMOKE").as_deref() == Ok("1")
+    common::smoke_enabled()
 }
 
 fn test_config() -> Config {
@@ -47,15 +48,25 @@ fn test_config() -> Config {
             listen_stdio: true,
             listen_http: None,
             enable_database_admin_tools: false,
+            enable_database_migration_tools: false,
+            expose_connection_details: false,
+            migration_schema_size_cap_bytes: 16 * 1024 * 1024,
+            migration_min_free_bytes: 256 * 1024 * 1024,
+            migration_shutdown_grace_s: 30,
             allowed_hosts: None,
         },
         typedb: TypeDbConfig {
-            address: "127.0.0.1:1729".into(),
+            address: common::address(),
             credentials: Credentials::Inline {
-                username: "admin".into(),
-                password: "password".into(),
+                username: common::username(),
+                password: common::password(),
             },
             tls_enabled: false,
+            addresses: None,
+            address_translation: None,
+            tls_root_ca_path: None,
+            request_timeout_s: None,
+            primary_failover_retries: None,
         },
         logging: LoggingConfig::default(),
     }
@@ -92,11 +103,7 @@ async fn connected_pair_with_config(
     Arc<SessionStore>,
 ) {
     let config = Arc::new(config);
-    let typedb = Arc::new(
-        TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-            .await
-            .expect("local TypeDB"),
-    );
+    let typedb = Arc::new(common::connect().await.expect("local TypeDB"));
     let sessions = SessionStore::new();
     let handler = TypeDbMcp::new(config, typedb, sessions.clone());
 
@@ -191,6 +198,7 @@ async fn mcp_default_tool_surface_is_exactly_raw_names_all() {
     actual.sort();
     let mut expected = tools::names::ALL
         .iter()
+        .filter(|name| **name != "export_database" && **name != "import_database")
         .map(|name| (*name).to_owned())
         .collect::<Vec<_>>();
     expected.sort();
@@ -280,8 +288,8 @@ async fn mcp_admin_tools_reject_current_session_open_transaction() {
     config.server.enable_database_admin_tools = true;
     let (server_handle, client, _sessions) = connected_pair_with_config(config).await;
     let sid = mint_sid(&client).await;
-    let db = format!("mcp_admin_open_{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let other_db = format!("mcp_admin_other_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let db = common::unique_database("mcp_admin_open");
+    let other_db = common::unique_database("mcp_admin_other");
 
     let result = call(
         &client,
@@ -355,7 +363,7 @@ async fn mcp_delete_database_rejects_other_session_open_transaction_on_target() 
     let (server_handle, client, _sessions) = connected_pair_with_config(config).await;
     let sid_open = mint_sid(&client).await;
     let sid_delete = mint_sid(&client).await;
-    let db = format!("mcp_admin_cross_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let db = common::unique_database("mcp_admin_cross");
 
     let result = call(
         &client,
@@ -544,10 +552,8 @@ async fn mcp_full_write_lifecycle() {
 
     // Set up a fresh database out-of-band so this default-surface lifecycle
     // test does not depend on the optional admin tools being enabled.
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!("mcp_in_process_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_in_process");
     setup.create_database(&db).await.unwrap();
 
     // Pre-create a schema (the MCP tool only exposes get_schema, not define).
@@ -697,13 +703,8 @@ async fn mcp_schema_commit_preserves_committer_gate_and_invalidates_other_sessio
     let sid_committer = mint_sid(&client).await;
     let sid_other = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!(
-        "mcp_schema_clear_{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_schema_clear");
     setup.create_database(&db).await.unwrap();
 
     for sid in [&sid_committer, &sid_other] {
@@ -846,13 +847,8 @@ async fn mcp_checkpoint_on_read_tx_returns_tx_is_read_and_leaves_tx_open() {
     let (server_handle, client, _sessions) = connected_pair().await;
     let sid = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!(
-        "mcp_checkpoint_read_{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_checkpoint_read");
     setup.create_database(&db).await.unwrap();
 
     let _ = call(
@@ -902,13 +898,8 @@ async fn mcp_schema_checkpoint_reopens_and_invalidates_other_sessions() {
     let sid_committer = mint_sid(&client).await;
     let sid_other = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!(
-        "mcp_schema_checkpoint_{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_schema_checkpoint");
     setup.create_database(&db).await.unwrap();
 
     for sid in [&sid_committer, &sid_other] {
@@ -1012,13 +1003,8 @@ async fn mcp_second_open_returns_tx_already_open() {
     let (server_handle, client, _sessions) = connected_pair().await;
     let sid = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!(
-        "mcp_already_open_{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_already_open");
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
         .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
@@ -1093,13 +1079,8 @@ async fn mcp_parallel_read_once_serializes() {
     let (server_handle, client, _sessions) = connected_pair().await;
     let sid = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!(
-        "mcp_parallel_read_{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_parallel_read");
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
         .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
@@ -1207,10 +1188,8 @@ async fn mcp_read_once_does_not_emit_tsv3() {
     let (server_handle, client, _sessions) = connected_pair().await;
     let sid = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!("mcp_no_tsv3_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_no_tsv3");
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
         .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
@@ -1290,13 +1269,8 @@ async fn mcp_expired_read_tx_session_does_not_emit_tsv3() {
     config.server.session_ttl_s = 3;
     let (server_handle, client, _sessions) = connected_pair_with_config(config).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!(
-        "mcp_expired_read_{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_expired_read");
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
         .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
@@ -1374,13 +1348,8 @@ async fn mcp_read_once_returns_full_multibatch_result() {
     let (server_handle, client, _sessions) = connected_pair().await;
     let sid = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!(
-        "mcp_read_once_drain_{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    );
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_read_once_drain");
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
         .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
@@ -1457,10 +1426,8 @@ async fn mcp_query_result_cap_keeps_read_tx_usable() {
     let (server_handle, client, _sessions) = connected_pair_with_config(config).await;
     let sid = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!("mcp_query_cap_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_query_cap");
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
         .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)
@@ -1549,10 +1516,8 @@ async fn mcp_parse_error_keeps_tx_open() {
     let (server_handle, client, _sessions) = connected_pair().await;
     let sid = mint_sid(&client).await;
 
-    let setup = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .unwrap();
-    let db = format!("mcp_parse_err_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let setup = common::connect().await.unwrap();
+    let db = common::unique_database("mcp_parse_err");
     setup.create_database(&db).await.unwrap();
     let schema_tx = setup
         .open_transaction(&db, typedb_mcp_core::typedb::TxKind::Schema)

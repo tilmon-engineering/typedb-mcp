@@ -1,40 +1,44 @@
+# Operator configuration. The binary reads this file via the path in
+# TYPEDB_MCP_CONFIG; use an absolute path for local stdio harnesses.
+
 [server]
-# Per-kind tx idle timeouts. Reads can hold for ~10 min cheaply (no
-# uncommitted state, no blocking); writes/schema stay aggressive because
-# they hold state and may block other tx. Reaper uses these to decide
-# when an idle tx gets released — `close()` for read, `rollback()` for
-# write/schema.
 idle_timeout_read_s   = 600
 idle_timeout_write_s  = 60
 idle_timeout_schema_s = 60
-session_ttl_s         = 3600   # session-level: SessionStore entry TTL, refreshed on every call
+session_ttl_s         = 3600
 result_cap            = 500
 listen_stdio          = true
-# listen_http  = "127.0.0.1:8765"     # not yet wired (see DESIGN.md §11)
-# Host-header allowlist for the HTTP transport. Default (when omitted) is
-# rmcp's loopback set ["localhost", "127.0.0.1", "::1"] — fine for local
-# stdio-style use, but rejects K8s Service DNS and Ingress hostnames.
-# Extend it for in-cluster deployments:
-# allowed_hosts = ["typedb-mcp.typedb.svc:8001", "typedb-mcp.example.com"]
-# Or disable the check entirely (only if upstream network isolation is enforced):
-# allowed_hosts = []
-# Disabled by default. When true, exposes destructive database-admin tools:
-# create_database and delete_database. Enable only for trusted/scratch deployments.
-# enable_database_admin_tools = false
+# listen_http = "127.0.0.1:8765"  # Streamable HTTP endpoint is /mcp
+# Restrict HTTP Host headers; omit for rmcp's loopback defaults.
+# allowed_hosts = ["typedb-mcp.example.com"]
+enable_database_admin_tools = false
+# Migration is stdio-only and default-off. Enable only for a trusted local child.
+enable_database_migration_tools = false
+expose_connection_details = false
+migration_schema_size_cap_bytes = 16777216   # 16 MiB
+migration_min_free_bytes = 268435456         # 256 MiB headroom reserve
+migration_shutdown_grace_s = 30
 
 [typedb]
-address     = "127.0.0.1:1729"        # gRPC host:port; no scheme
-tls_enabled = false                   # set true for production / TLS-fronted servers
+# Exactly one of address, addresses, or address_translation must be non-empty.
+address = "127.0.0.1:1729"                  # gRPC host:port; no scheme
+# addresses = ["db-a.example:1729", "db-b.example:1729"]
+# address_translation = { "advertised:1729" = "reachable:1729" }
+tls_enabled = false
+tls_root_ca_path = "/absolute/path/to/ca.pem" # requires tls_enabled=true
+# request_timeout_s = 30       # positive unary request bound, not query/commit deadline
+# primary_failover_retries = 0 # nonnegative upstream option; mutations are not retried
 
 [typedb.credentials]
-source       = "env"
+source = "env"
 username_var = "TYPEDB_USER"
 password_var = "TYPEDB_PASS"
 
+# Inline credentials are supported but should not be committed:
 # [typedb.credentials]
-# source   = "inline"
-# username = "admin"
-# password = "password"
+# source = "inline"
+# username = "<set locally>"
+# password = "<set locally>"
 
 [logging]
-# audit_log_path = "/var/log/teng-typedb-mcp/audit.jsonl"
+# audit_log_path = "/absolute/path/typedb-mcp-audit.jsonl"

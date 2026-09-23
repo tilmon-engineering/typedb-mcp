@@ -19,6 +19,10 @@ tracing = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 futures = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

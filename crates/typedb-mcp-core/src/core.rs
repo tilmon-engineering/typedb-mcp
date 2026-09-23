@@ -15,6 +15,18 @@
 
 use std::{sync::Arc, time::Instant};
 
+/// Explicit authority for transport-sensitive operations.
+///
+/// `Unspecified` is the compatibility default and intentionally denies
+/// stdio-only capabilities such as database migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExecutionContext {
+    #[default]
+    Unspecified,
+    Stdio,
+    Http,
+}
+
 use rmcp::model::CallToolResult;
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -41,14 +53,21 @@ use crate::{
 /// library consumers.
 pub trait HasTypeDbCore: Clone + Send + Sync + 'static {
     fn typedb_core(&self) -> &Arc<TypeDbCore>;
+
+    /// Explicit transport context used to authorize transport-sensitive tools.
+    /// Existing consumers remain source-compatible and default to denial.
+    fn execution_context(&self) -> ExecutionContext {
+        ExecutionContext::Unspecified
+    }
 }
 
 /// Process-global kernel. Cheaply cloneable through `Arc`.
-#[derive(Debug)]
 pub struct TypeDbCore {
     pub config: Arc<Config>,
     pub typedb: Arc<TypeDbClient>,
     pub sessions: Arc<SessionStore>,
+    pub coordinator: crate::coordinator::OperationCoordinator,
+    pub migration_supervisor: crate::migration::MigrationSupervisor,
 }
 
 impl TypeDbCore {
@@ -60,15 +79,48 @@ impl TypeDbCore {
         typedb: Arc<TypeDbClient>,
         sessions: Arc<SessionStore>,
     ) -> Arc<Self> {
+        let coordinator = crate::coordinator::OperationCoordinator::new();
+        // The migration backend is built lazily ON the worker thread: its
+        // private runtime + dedicated driver (retries=0) must never be
+        // constructed inside the main Tokio runtime context, and it must
+        // never share the main client's runtime-affine gRPC channels. A
+        // factory failure (e.g. unreachable upstream) surfaces later as a
+        // lifecycle-honest backend error on the submitted job.
+        let factory: crate::migration::BackendFactory = {
+            let cfg = config.clone();
+            Box::new(move || {
+                let settings = cfg
+                    .connection_settings()
+                    .map_err(|e| format!("invalid connection settings: {e}"))?;
+                let (user, pass) = cfg
+                    .typedb_credentials()
+                    .map_err(|e| format!("credentials unavailable: {e}"))?;
+                let backend =
+                    crate::typedb::TypeDbMigrationBackend::connect(&settings, &user, &pass)?;
+                Ok(Arc::new(backend) as Arc<dyn crate::migration::MigrationBackend>)
+            })
+        };
+        let migration_settings = crate::migration::MigrationSettings {
+            schema_size_cap_bytes: config.server.migration_schema_size_cap_bytes,
+            min_free_bytes: config.server.migration_min_free_bytes,
+        };
+        let migration_supervisor = crate::migration::MigrationSupervisor::with_factory_and_settings(
+            factory,
+            coordinator.clone(),
+            migration_settings,
+        );
         Arc::new(Self {
             config,
             typedb,
             sessions,
+            coordinator,
+            migration_supervisor,
         })
     }
 
     /// Connect to TypeDB using the credentials in `config`, allocate a
     /// fresh in-memory `SessionStore`, and return a ready-to-use kernel.
+    #[allow(clippy::result_large_err)]
     pub async fn connect(config: Arc<Config>) -> Result<Arc<Self>, InternalError> {
         let (user, pass) = config
             .typedb_credentials()
@@ -511,7 +563,7 @@ impl<'a> SessionHandle<'a> {
                         self.ok(json, hints_on_ok).await
                     }
                     Err(e) => {
-                        let internal = InternalError::Driver(e);
+                        let internal = InternalError::from(e);
                         let class = internal.to_class();
                         self.err(
                             internal,
@@ -559,12 +611,13 @@ impl<'a> SessionHandle<'a> {
 /// `RESULT_LIMIT_EXCEEDED` — typically by returning an `InternalError`
 /// that classifies to it, or by inspecting `json.truncated` and emitting
 /// the canonical envelope directly.
+#[allow(clippy::result_large_err)]
 pub async fn run_typeql(
     tx: &DriverTransaction,
     query: &str,
     cap: usize,
 ) -> Result<crate::typedb::QueryAnswerJson, InternalError> {
-    let answer = tx.query(query).await.map_err(InternalError::Driver)?;
+    let answer = tx.query(query).await.map_err(InternalError::from)?;
     query_answer_to_json(answer, cap).await
 }
 

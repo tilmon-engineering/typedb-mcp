@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Error classes returned to the agent. See DESIGN.md §5.
 //!
 //! This module is the single place where TypeDB's error-code stacks are

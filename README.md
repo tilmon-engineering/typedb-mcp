@@ -1,328 +1,85 @@
 # typedb-mcp
 
-A safety-focused [Model Context Protocol](https://modelcontextprotocol.io)
-server that exposes a [TypeDB 3.12+](https://typedb.com) database to an LLM
-agent. Written in Rust, built on the official `typedb-driver` (gRPC) and
-the `rmcp` SDK.
+A safety-focused [Model Context Protocol](https://modelcontextprotocol.io) server exposing a TypeDB 3.12+ database through the official Rust `typedb-driver` (gRPC) and `rmcp` SDK. This is an independent Rust/gRPC implementation, not a drop-in replacement for the upstream Python/HTTP server.
 
-This is an independent reimplementation, in Rust on gRPC, of the
-official [`typedb/typedb-mcp`](https://github.com/typedb/typedb-mcp)
-Python (HTTP) server. The transport URL (`/mcp` on the configured port)
-and the broad shape of the tool surface match upstream's intent, but
-**this is not a drop-in replacement**:
+## Support and tool surface
 
-1. The tool surface diverges in shape: this server adds `start_session`
-   as the entry point, and **every other tool requires a `session_id`
-   argument** (see `DESIGN.md` §3 and §7). Existing clients written
-   against the upstream Python server will need to thread `session_id`
-   through every call.
-2. The lifecycle is gated: schema must be read before a transaction can
-   be opened on a database, only one transaction is open at a time, and
-   the response envelope is structured (`session`, `next_moves`,
-   `result` / `error`).
-3. The TypeDB endpoint is gRPC (default `:1729`), not the HTTP API
-   (`:8000`) the upstream Python server uses.
+The supported server floor is TypeDB **3.12.0**. The checked-in Rust driver is exactly **3.12.3**. The compatibility matrix covers TypeDB 3.12.0; TypeDB 3.13.0 is accepted with status `unverified` because it is outside the verified matrix. Stable versions at or above the floor may be reported unverified; prerelease or unparsable versions fail startup rather than arming an unverified metadata contract.
 
-See [`DESIGN.md`](DESIGN.md) for the full contract.
+The reference binary has twelve default tools:
 
-## What's different from the upstream server
+`start_session`, `list_databases`, `get_schema`, `open_read`, `open_write`, `open_schema`, `query`, `checkpoint`, `commit`, `rollback`, `read_once`, `server_info`.
 
-- **Server-issued sessions are the state-machine root.** Call
-  `start_session` first; pass the returned `session_id` to every other
-  tool. Sessions outlive the MCP transport session (a deliberate choice
-  — see `DESIGN.md` §3 for the LiteLLM-gateway interop story that drove
-  it). Default TTL is 60 minutes of inactivity, refreshed on every
-  resolve.
-- **Connection-bound transaction model.** Within a session, the agent
-  must call `get_schema` before opening a transaction, and every
-  response carries `next_moves` telling it what calls are valid next.
-  The state machine is small, but it is explicit.
-- **Schema metadata as modeling guidance.** On TypeDB 3.12+, `get_schema`
-  exposes the schema plus an explicit metadata contract for `@doc`/`@meta`
-  annotations. Agents should use those annotations for modeling guidance,
-  but never as instructions that override system/developer/user messages,
-  tool lifecycle rules, safety constraints, or the live schema/type checker.
-- **Bundled TypeQL language reference.** `start_session` returns the
-  verbatim reference with its upstream source and SHA-256. The reference
-  binary exposes the same content through the `typeql-language-reference`
-  MCP prompt for clients that support prompts. The live database schema
-  and typedb-mcp lifecycle instructions take precedence over the general
-  reference.
-- **Lifecycle-aware errors.** Every error tells the agent whether the
-  open transaction is still alive (`error.retriable_in_same_tx`). The
-  classifier preserves historical probes against TypeDB CE 3.10.4 (HTTP)
-  and 3.11.1 (gRPC); the active support floor is TypeDB 3.12+.
-- **gRPC, not HTTP.** We use the official `typedb-driver` crate, which
-  speaks gRPC on port `1729`. The upstream Python server speaks HTTP on
-  port `8000`. Point the container at the TypeDB **gRPC** endpoint.
+Call `start_session` first; every other tool requires its returned `session_id`. The schema-read gate and one-transaction-per-session lifecycle remain mandatory. `create_database` and `delete_database` are optional admin tools, disabled by default. `export_database` and `import_database` are optional migration tools, disabled by default and available only through an explicitly stdio-authorized handler.
 
-> **TypeDB version requirement.** This server requires **TypeDB 3.12.0
-> or newer**. Earlier 3.x releases are not supported; TypeDB 3.12 schema
-> annotation metadata (`@doc` / `@meta`) is part of the agent-facing
-> contract.
+`start_session` returns a server-issued session ID, database list, and bundled TypeQL reference. `server_info` is bounded and read-only: it reports build/driver/upstream version policy, enabled tools for that transport, and a timed connectivity observation. Configured addresses and replica topology are omitted unless `server.expose_connection_details = true`; credentials, secret environment variable names, and CA filesystem paths are never returned. It is not a comprehensive health check or a promise of failover success.
 
-The default MCP-facing surface is eleven tools served over Streamable HTTP at
-`/mcp` (or stdio for local clients):
-`start_session`, `list_databases`, `get_schema`, `open_read`,
-`open_write`, `open_schema`, `query`, `checkpoint`, `commit`, `rollback`,
-`read_once`.
-Optional destructive database-admin tools (`create_database`,
-`delete_database`) are absent unless explicitly enabled by operator config.
+## Configuration
 
-## Theory: agent affordances are user affordances
-
-The design of this server rests on one observation: **the things that make
-a tool easier for a human to use correctly are the same things that make
-it easier for an agent to use correctly**. The two populations have
-different failure modes — humans get bored, agents hallucinate — but they
-fail for a shared underlying reason, which is that *both have to resolve
-indirection to act, and both have a finite budget for doing so*.
-
-### Indirection resolution
-
-Consider two errors:
-
-> Specified database does not exist.
-
-versus
-
-> Specified database `agnts` does not exist. Available databases: `agents`,
-> `ost`, `scratch`.
-
-The first error tells the caller that something is wrong. To recover from
-it, the caller has to do additional work: figure out which database was
-specified, list the databases that *do* exist, compare the two, guess at
-the intended name, and retry. Every one of those steps is a hop of
-indirection — a separate question the caller has to answer before it can
-make progress.
-
-The second error collapses all of those hops into the response itself.
-The caller does not have to ask "what databases exist?" because that
-question is already answered. It does not have to ask "what did I
-specify?" because the verbatim input is quoted. The recovery path is
-one read, not five.
-
-A human reading the first error is mildly inconvenienced. An agent
-reading the first error has to spend tokens on a multi-turn investigation
-that ends, often, in a fabricated database name. The cost differential
-between the two error messages is small for the human and large for the
-agent — but the *direction* of the cost is the same. Better is better
-for both.
-
-### Attention stacking
-
-A related cost is what we'll call *attention stacking*: the implicit
-dimensional context that conversation participants are expected to
-silently track on each other's behalf.
-
-Consider a sentence like "the Publisher API is slow." Real systems have
-many dimensions along which "the Publisher API" might vary — preprod or
-prod, region, internal or external endpoint, current release or the
-canary, this tenant or that one. The sentence fixes none of those
-dimensions explicitly. To act on it, every reader has to consult a
-running mental model of the conversation so far and decide which
-dimensions are pinned, which are still variable, and which were pinned
-several turns ago and might have drifted since. That running model is
-the stack; using it is the attention cost.
-
-Humans pay this cost reasonably well over short conversations, with
-people they know, in domains they're current on. The cost rises sharply
-when any of those conditions weaken — new participant, long thread,
-unfamiliar subsystem. Agents pay this cost on every single turn, with
-no continuity beyond the literal text in their context, and the failure
-mode when the stack mis-resolves is not "ask a clarifying question" but
-"confidently act on the wrong referent."
-
-Pronouns are the densest case of the same phenomenon. "It calls the API
-and then it returns the result, which it then passes to the handler"
-has three `it`s with three different referents; resolving each one
-requires the reader to walk back through prior context and pick the
-right antecedent. Drop the pronouns and the indirection drops with
-them.
-
-The mitigation is mechanical and slightly tedious: when writing for a
-system that involves multiple actors, environments, or objects, fully
-qualify the reference every time. Not "the Publisher API" but "the
-preprod Publisher API in `us-east-1`". Not "it returns the result" but
-"`fetch_user` returns the `User` record". The prose gets longer. The
-attention budget drops to near zero. For anything an agent will read,
-and for any technical conversation that crosses more than two
-participants or more than ten minutes, that is the right trade.
-
-### How those principles show up in this server
-
-- **`next_moves` on every response.** The agent is stateless between
-  tool calls beyond what the response carries. Rather than expect the
-  agent to remember the state machine, every response re-teaches the
-  immediate horizon — the literal tool names that are valid next, given
-  the session's current state. The agent does not have to resolve "what
-  comes after a successful `open_write`?" because the response already
-  answered it.
-
-- **Lifecycle-aware errors.** Every error answers, in the same envelope,
-  the question "is my transaction still alive?" via a structured
-  `retriable_in_same_tx` boolean and a prose sentence. The agent does
-  not have to cross-reference the error class against a table in
-  `DESIGN.md` to decide whether to retry or to open a fresh transaction.
-
-- **Schema-read gate, enforced and explained.** The server refuses to
-  open a transaction on a database whose schema the session has not yet
-  read. That refusal is enforced in code and *also* documented in the
-  tool descriptions the agent sees. The constraint is not a hidden
-  precondition that surfaces as a confusing error; it is a stated rule
-  with a named recovery path.
-
-- **Plain, fully-qualified prose in tool descriptions.** Tool
-  descriptions name the tools they reference (`open_read`, `commit`)
-  with literal backticked names rather than "the read tool" or "the
-  finalization step". This costs a handful of tokens and removes a
-  category of agent mis-resolution entirely.
-
-None of this is novel. It is the same set of techniques a careful
-technical writer would apply to documentation for a human audience. The
-claim of this server is just that those techniques are not optional when
-the reader is an LLM, because the LLM has no way to ask a follow-up
-question on its own behalf — every ambiguity it encounters either gets
-resolved by additional tool calls (expensive) or papered over by
-fabrication (worse).
-
-The shorthand: **build for the agent the way you would build for a
-careful but tired human, and both will do better work**.
-
-## Running the container
-
-Published to GitHub Container Registry:
-`ghcr.io/tilmon-engineering/typedb-mcp`.
+The binary loads TOML with `Config::load_from_path`. Set `TYPEDB_MCP_CONFIG` to the config file path; otherwise it attempts `config.toml` in its current working directory. A local stdio harness should use an **absolute** config path because its child may have a foreign working directory:
 
 ```bash
-docker run -p 8001:8001 ghcr.io/tilmon-engineering/typedb-mcp:latest \
-    --typedb-address host.docker.internal:1729 \
-    --typedb-username admin \
-    --typedb-password password
+TYPEDB_MCP_CONFIG=/home/operator/typedb-mcp/config.local.toml \
+  /home/operator/typedb-mcp/target/release/typedb-mcp
 ```
 
-On Linux add `--add-host=host.docker.internal:host-gateway` to reach a
-TypeDB running on the host.
+The executable path and config path above are examples only; do not put credentials in command lines or committed files. Credentials should use environment-variable names in TOML and be supplied only to the child process. See `config.example.toml` and `config.smoke.toml`.
 
-### Flags and env vars
+The only address configuration forms are `typedb.address`, a non-empty `typedb.addresses` list, or a non-empty `typedb.address_translation` map. Exactly one must be present. `tls_root_ca_path` requires `tls_enabled = true` and must be an absolute path. `request_timeout_s` is a positive **unary driver request** bound; it is not an in-transaction `query` or `commit` deadline. `primary_failover_retries` configures the upstream driver option; this project adds no automatic application retries, especially not for mutations. Migration uses a separately built driver with retries forced to zero.
 
-| Flag                | Env var            | Default              | Notes                          |
-| ------------------- | ------------------ | -------------------- | ------------------------------ |
-| `--typedb-address`  | `TYPEDB_ADDRESS`   | `127.0.0.1:1729`     | TypeDB **gRPC** endpoint.      |
-| `--typedb-username` | `TYPEDB_USERNAME`  | `admin`              |                                |
-| `--typedb-password` | `TYPEDB_PASSWORD`  | `password`           |                                |
-| `--typedb-tls`      | `TYPEDB_TLS`       | `false`              | `true` for TLS-fronted TypeDB. |
-| `--listen-http`     | `LISTEN_HTTP`      | `0.0.0.0:8001`       | MCP served at `/mcp`.          |
+Defaults include: stdio enabled; HTTP absent/disabled; read/write/schema idle timeouts 600/60/60 seconds; session TTL 3600 seconds; result cap 500; admin, migration, and connection-detail disclosure disabled; migration schema cap 16 MiB; migration destination free-space reserve 256 MiB; shutdown grace 30 seconds. Both transports may be enabled together. HTTP uses `/mcp` and should retain a restrictive `allowed_hosts` policy. The existing create/delete policy is unchanged: both are absent unless `enable_database_admin_tools = true`, and delete requires exact confirmation.
 
-A leading `http://` on `--typedb-address` is stripped for compatibility
-with copy-pasted upstream commands, but the port must still point at gRPC.
+## Local stdio harness
 
-### `config.toml` extras
-
-A handful of knobs are only reachable via the config file (`config.toml`
-in CWD, or `TYPEDB_MCP_CONFIG=/path/to/config.toml`):
+Stdio is a local child process. Use an absolute executable and absolute `TYPEDB_MCP_CONFIG`; do not rely on cwd, `~`, shell expansion, URLs, or relative paths. The child runs as the operator’s stdio account and its filesystem namespace is authoritative. Co-location of a client, MCP process, and TypeDB container does **not** imply shared mounts; a container child namespace must actually have the files mounted at the paths supplied to tools. Migration remains default-off:
 
 ```toml
 [server]
-session_ttl_s         = 3600          # SessionStore entry TTL (default 60 min)
-# Per-kind tx-idle reaper timeouts. Reads can hold for a long agent
-# turn cheaply (no uncommitted state, no blocking); writes/schema
-# stay aggressive (they hold state, schema blocks readers).
-idle_timeout_read_s   = 600           # default 600 s
-idle_timeout_write_s  = 60            # default  60 s
-idle_timeout_schema_s = 60            # default  60 s
-result_cap            = 500           # max answers per query response
-
-# Streamable HTTP Host-header allowlist. Omit to keep rmcp's loopback
-# default (localhost, 127.0.0.1, ::1) — fine for local stdio-style use.
-# Extend for Kubernetes Service DNS / Ingress hostnames:
-# allowed_hosts = ["typedb-mcp.typedb.svc:8001", "typedb-mcp.example.com"]
-# Or `[]` to disable the check entirely (only if upstream network
-# isolation is enforced); logs WARN on startup if you do.
+listen_stdio = true
+# listen_http omitted
+# enable_database_migration_tools = false
 ```
 
-### Kubernetes / behind an Ingress
+On stdio EOF the reference binary shuts down the whole process. Logs go to stderr; stdout is reserved for MCP protocol frames. HTTP live checks must use only normal tools and explicitly exclude file migration tools.
 
-By default the Streamable HTTP transport only accepts requests whose
-`Host` header is `localhost`, `127.0.0.1`, or `::1` (rmcp's
-DNS-rebinding defense). In-cluster Service DNS and Ingress hostnames
-are rejected with a `403 Forbidden: Host header is not allowed`. Set
-`server.allowed_hosts` in `config.toml` to extend the allowlist; see
-the snippet above.
+## Database migration (stdio only, opt-in)
 
-### Wiring an MCP client
+Set `server.enable_database_migration_tools = true` in a stdio config. The routes are `export_database` and `import_database`; they are not listed or callable over HTTP, including mixed-transport sessions. File paths are absolute native paths only: no relative, cwd, tilde, drive-relative/root-relative Windows, URL, or expansion notation. Paths must be distinct regular files as applicable; export destinations must not exist (including dangling symlinks), and there is no overwrite option.
 
-Point your client at `http://<host>:8001/mcp`. For Cursor:
+Export requires a prior `get_schema` for the source and writes schema/data through private staging directories on each destination filesystem. The preflight free-space check enforces only the configured 256 MiB reserve by default. This is **headroom, not proof that the export will fit**: no source-size estimate is assumed. Results include resolved paths, byte sizes, and streaming SHA-256 checksums. Publication is two-file and not atomic; a second-publication failure is reported as partial with precise surviving paths. The server never deletes a path whose ownership is uncertain.
 
-```json
-{
-  "mcpServers": {
-    "typedb": { "url": "http://localhost:8001/mcp" }
-  }
-}
-```
+Import validates UTF-8 schema size (16 MiB default), file identity, complete length-delimited framing, sizes, and checksums, then copies inputs into private staging before invoking TypeDB. It requires `confirm_database` to exactly equal `database` (byte-for-byte string equality) and the target database must not exist. Import is new-target-only; it never overwrites, deletes, retries, or recreates a target. After a successful import, call `get_schema` before normal transactions because the target schema gate is invalidated for live sessions.
 
-### Tool flow (agent's-eye view)
+Cancellation, driver failure, disk-full errors, malformed framing, and publication failures are reported honestly. An import that may have reached TypeDB is `unknown_or_partial`; do not assume rollback or atomic crash recovery. Responses include checksums/sizes where known. The worker owns reservations and cleanup until completion even if the caller disconnects. Ordinary failures clean only owned staging files; a process crash can leave staging files for operator inspection and cleanup. External TypeDB clients are outside this process-local coordination, so they may race; the server never auto-deletes a possibly externally created target.
 
-The expected call sequence for a write-and-verify task:
+These are client export/import paths, not TypeDB’s server data directory. Do not copy, edit, or restore TypeDB’s internal data directory as if it were a migration file. For upgrades and backups, follow the TypeDB release documentation and your tested backup/restore runbook; this server does not schedule backups or claim crash atomicity.
 
-```
-start_session()
-  -> { session_id: "abc…", databases: [...] }
+## Security and transports
 
-get_schema(session_id, database)
-  -> returns schema plus metadata contract; arms the schema-read gate for that database
+Both stdio and Streamable HTTP can reach the same TypeDB connection and ordinary transaction tools, so apply least privilege and network controls to both. Stdio additionally grants explicitly opted-in local filesystem migration authority to the trusted child account. HTTP never receives that authority, even if a session ID originated over stdio. Configure HTTP Host-header allowlisting and place it behind appropriate authentication/network policy; do not expose an unprotected listener. Connection-detail disclosure is off by default and never includes credentials or CA paths.
 
-open_write(session_id, database)
-  -> transaction is now open
+The TypeDB endpoint is gRPC (normally port 1729), not the upstream Python server’s HTTP port 8000. A historical upstream redirect fix, where relevant, was TypeScript-only; it is not a Rust driver claim.
 
-query(session_id, query="insert ...")
-  -> insert lands inside the open tx; not yet persisted
-
-checkpoint(session_id)  # optional when more write/schema work remains
-  -> current batch durable; fresh transaction already open
-
-commit(session_id)
-  -> final writes durable and transaction closed
-
-read_once(session_id, database, query="match ...")
-  -> verify
-```
-
-Any tool other than `start_session` returns `SESSION_UNKNOWN` or
-`SESSION_EXPIRED` if `session_id` does not resolve; the response's
-`next_moves` directs the agent to call `start_session` and reissue.
-
-## Running from source
+## Running and testing
 
 ```bash
 cargo run --release
+# or, with an explicit file:
+TYPEDB_MCP_CONFIG=/absolute/path/config.example.toml \
+  cargo run --release -p typedb-mcp
 ```
 
-Reads `config.toml` from the working directory, or whatever
-`TYPEDB_MCP_CONFIG` points at. See `config.example.toml`.
-
-The default config enables the stdio transport, which is what local MCP
-clients (e.g. Claude Code) expect. To run the HTTP transport instead,
-uncomment `listen_http` in your config or use the container.
-
-## Tests
-
-Unit tests for the error classifier run with `cargo test`. The smoke
-and in-process integration tests need a live TypeDB at `127.0.0.1:1729`
-and are gated:
+For disposable live compatibility testing, use the runner (not production resources):
 
 ```bash
-TYPEDB_MCP_SMOKE=1 cargo test
+TYPEDB_MCP_SMOKE=1 bash scripts/compatibility_matrix.sh
+# optionally: ... compatibility_matrix.sh 3.12.0 3.13.0
 ```
+
+The runner uses podman or docker, dynamically allocated loopback ports, authenticated readiness checks, and removes only its own containers. If neither runtime is available it fails with an actionable error; it does not silently pass.
+
+See [`DESIGN.md`](DESIGN.md) for the state machine and [`RELEASE.md`](RELEASE.md) for the reproducible release gate and authorized deployment workflow.
 
 ## License
 
-Dual-licensed under either of:
-
-- MIT License ([LICENSE-MIT](LICENSE-MIT) or
-  <https://opensource.org/licenses/MIT>)
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  <https://www.apache.org/licenses/LICENSE-2.0>)
-
-at your option.
+Dual-licensed under MIT or Apache-2.0; see `LICENSE-MIT` and `LICENSE-APACHE`.

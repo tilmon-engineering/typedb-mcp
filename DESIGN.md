@@ -44,11 +44,11 @@ agent-facing state machine.
 
 ### Hybrid library + application
 
-typedb-mcp ships in two shapes: a **server binary** with the eleven default
-tools enumerated in §7 (plus optional database-admin tools only when the
-operator explicitly enables them), and a **library crate** that exposes
-the same connection, session, transaction, and envelope machinery for
-other MCP servers to embed. A consuming server may mount the eleven raw
+typedb-mcp ships in two shapes: a **server binary** with the twelve default
+tools enumerated in §7 (plus optional database-admin and migration tools only
+when the operator explicitly enables them), and a **library crate** that
+exposes the same connection, session, transaction, and envelope machinery for
+other MCP servers to embed. A consuming server may mount the twelve raw
 tools verbatim, prefix them, omit some, opt into the database-admin tools,
 or add semantic tools of its own — but any TypeDB-backed tool it adds
 **must** go through the library's transaction helpers, so the safety
@@ -64,7 +64,11 @@ API is described in §11; it is the authoritative integration surface.
 - **Language**: Rust (stable), async on Tokio.
 - **MCP library**: `rmcp`, the official Anthropic Model Context Protocol Rust
   SDK. Both stdio and Streamable HTTP transports are supported behind a single
-  tool-handler abstraction; the design assumes both are exposed by default.
+tool-handler abstraction. The reference binary may enable either or both;
+stdio-only local filesystem operations are never exposed on HTTP. Library
+constructors default to an unspecified context with migration tools disabled;
+transport authority is explicit, never inferred from global configuration,
+request parameters, headers, or session state.
 - **Session model**: one MCP session corresponds to one optional open TypeDB
   transaction. `rmcp` provides `SessionId` via `RequestContext.extensions`;
   the server keeps a map of `SessionId -> SessionState`.
@@ -514,19 +518,19 @@ Notes:
 
 ## 7. Tool surface
 
-Eleven tools are mounted by default. The first, `start_session`, mints the
+Twelve tools are mounted by default. The first, `start_session`, mints the
 `session_id` that every other default tool requires (see §3). All
 non-`start_session` tools take `session_id: string` as a required
 argument and return `SESSION_UNKNOWN` or `SESSION_EXPIRED` if it does not
 resolve.
 
-The eleven tools enumerated in §7.0-§7.10 are the defaults the **binary**
-mounts: `start_session`, `list_databases`, `get_schema`, `open_read`,
-`open_write`, `open_schema`, `query`, `checkpoint`, `commit`, `rollback`,
-and `read_once`. Two additional database-admin tools (§7.11-§7.12) exist
-but are absent unless the operator explicitly sets
-`server.enable_database_admin_tools = true`; default deployments therefore
-still advertise exactly `tools::names::ALL`. Library consumers (§11) may
+The twelve tools enumerated in §7.0-§7.10 plus §7.10.1 are the defaults the
+**binary** mounts: `start_session`, `list_databases`, `get_schema`,
+`open_read`, `open_write`, `open_schema`, `query`, `checkpoint`, `commit`,
+`rollback`, `read_once`, and `server_info`. Two database-admin tools
+(§7.11-§7.12) and two migration tools (§7.13-§7.14) are absent unless the
+operator explicitly enables their respective flags. Library consumers (§11)
+may
 prefix raw tool names, omit individual tools, expose only a subset, or opt
 into the gated admin tools — subject to the safety thesis (§1): no
 consumer-added tool may compose into a `write_once` / `schema_once` shape,
@@ -543,7 +547,9 @@ enforced.
   TypeQL reference. The live database schema and this server's lifecycle
   instructions take precedence over its general guidance.
   `expires_in_seconds` is the configured
-  TTL (per-call resolution refreshes it); reporting it relative rather
+  TTL (per-call resolution refreshes it); the result also includes a concise
+  available-tool/version summary for this transport, without topology.
+  Reporting `expires_in_seconds` relative rather
   than as an absolute timestamp avoids any clock-skew confusion at the
   agent. The database list is returned for
   convenience — it is the same content `list_databases` returns and makes
@@ -710,6 +716,23 @@ returns the reference.
   that the agent must look at the data before committing a write. A one-shot
   write would undo that.
 
+### 7.10.1 `server_info`
+
+- **Params**: `session_id: string`
+- **Returns**: bounded, read-only diagnostics: MCP build version, verified
+  driver version, upstream distribution/version, configured support floor,
+  tested or unverified compatibility status, enabled tools for this transport,
+  and a timed connectivity observation.
+- **Annotation**: read-only, idempotent
+- **Gate**: valid session; one overall diagnostic deadline; no mutation.
+- **Disclosure**: configured addresses and actual replica topology are omitted
+  by default and included only when `server.expose_connection_details = true`.
+  Never return credentials, CA paths, secret environment names, or raw config
+  debug output. Topology is driver data with nullable unknown fields and
+  per-section errors; it is not a comprehensive health check or a promise of
+  failover success. Base connectivity/version failure is a lifecycle envelope;
+  topology failure may be partial success with explicit status.
+
 ### 7.11 `create_database` (optional admin tool)
 
 - **Availability**: absent by default. Mounted only when the operator sets
@@ -748,6 +771,70 @@ returns the reference.
   confirmation field, and rejects while transactions are open on the target
   database.
 
+### 7.13 `export_database` (optional stdio-only migration tool)
+
+- **Availability**: absent by default; mounted only when
+  `server.enable_database_migration_tools = true` and the immutable execution
+  context is `Stdio`. It is never advertised or callable over HTTP/SSE.
+- **Params**: `session_id`, `database`, `schema_file_path`, `data_file_path`.
+  Paths must be absolute native paths; no cwd, tilde, environment, URL, shell,
+  drive-relative, or root-relative expansion is accepted.
+- **Gate**: valid session, no open caller transaction, prior `get_schema` for
+  the source, conservative database-name validation, regular readable files'
+  parents, and distinct canonical destinations that do not exist (including
+  dangling symlinks). Export destinations are never overwritten; final
+  publication enforces no-clobber races.
+- **Behaviour**: use TypeDB's export lifecycle, not a caller transaction. Run
+  blocking work on the dedicated migration worker. Stage on each destination
+  filesystem, stream SHA-256 and sizes, flush/sync, then publish each file.
+  Two-file publication is not atomic; report exact surviving paths and partial
+  status on second-publication failure and never remove uncertain ownership.
+  A configured free-space reserve (default 256 MiB) is headroom only, not proof
+  the export fits. Return resolved paths and manifest hashes/sizes, not contents.
+
+### 7.14 `import_database` (optional stdio-only migration tool)
+
+- **Availability**: same explicit stdio and operator gates as export.
+- **Params**: `session_id`, `database`, `schema_file_path`, `data_file_path`,
+  `confirm_database`.
+- **Gate**: valid session, no open caller transaction, exact confirmation,
+  conservative name validation, target nonexistent at the final pre-import
+  check, absolute distinct regular input files, valid UTF-8 schema no larger
+  than the configured cap (default 16 MiB), and complete length-delimited
+  unsigned-varint record framing. Do not require `get_schema` for a nonexistent
+  target.
+- **Behaviour**: import is an administrative TypeDB lifecycle, not a general
+  `write_once` replacement and not a caller-owned transaction. Snapshot and
+  validate inputs in private staging before upstream mutation; do not allocate
+  payload-sized buffers or decode framing as protobuf semantics. Use the
+  published driver import API with schema **content**, no wrapper retries, and
+  a separately constructed migration driver whose primary failover retries are
+  zero.
+
+  The data-file framing contract is **source-verified against
+  `typedb-driver` 3.12.3** (`src/database/database.rs`,
+  `src/database/database_manager.rs`, registry source, 2026-09-10):
+  `Database::export_to_file` writes the schema file as streamed UTF-8 text and
+  the data file as a sequence of protobuf `Item` messages encoded with
+  `encode_length_delimited` (unsigned-varint length prefix per record);
+  `DatabaseManager::import_from_file` reads the data path back through the
+  same length-delimited iterator and takes the schema as string content.
+  Well-framed but semantically invalid records remain a legitimate upstream
+  error (uncertain-import policy), because framing validation does not decode
+  protobuf contents. This contract is pinned to the validated driver release;
+  re-verify on any driver upgrade before trusting preflight framing
+  rejection. On any post-start error or interruption, report
+  `unknown_or_partial` when appropriate, attempt bounded read-only target
+  reconciliation, never auto-delete/retry/recreate, and invalidate target
+  schema-seen state everywhere after success. Return hashes/sizes and target
+  status, never database contents.
+
+All migration validation and filesystem failures use lifecycle-aware local
+error envelopes and must not be classified as TypeDB transaction poisoning.
+Absolute paths clarify authority; they are not a filesystem sandbox, and the
+operator's stdio account remains authoritative. The design does not claim
+protection against a hostile same-user process racing parent-directory changes.
+
 ---
 
 ## 7a. Schema annotation metadata guidance
@@ -783,10 +870,17 @@ supported server omits annotations from schema export, `get_schema` must add
 a complete metadata-query extraction path or fail before arming
 `schema_seen`.
 
-No startup server-version API is currently used by typedb-mcp. The active
-support floor is documented and enforced operationally by the 3.12 driver
-requirement plus metadata-aware `get_schema` smoke coverage against TypeDB
-3.12+.
+At connection time the server must fetch the upstream version and reject a
+positively identified stable version below 3.12.0. Unparsable or prerelease
+versions are unverified and must fail startup with actionable text rather than
+arming a false metadata guarantee. Stable newer versions may connect with
+compatibility status `unverified` unless covered by the tested matrix, while
+still enforcing metadata gates. A version-RPC failure is a connection failure,
+not a synthesized version. The validated release pins `typedb-driver` exactly
+at `=3.12.3`; the design must expose a checked-in consistency check comparing
+that requirement, the Cargo.lock entry, and the driver version reported by
+`server_info` (this is not runtime dependency introspection). The tested
+matrix status must report what was actually tested, not imply that tests passed.
 
 ---
 
@@ -822,6 +916,8 @@ returns rows 4-6.
 
 ```toml
 [server]
+# Transport defaults are operator policy; the reference binary may enable either
+# or both. Library constructors use an unspecified context and migration off.
 # Per-kind tx idle timeouts. Asymmetric because the costs are
 # asymmetric: read tx hold no uncommitted state and don't block other
 # tx, so they get a long leash for slow agent turns; write/schema hold
@@ -833,13 +929,24 @@ session_ttl_s         = 3600   # session-level: TTL on the SessionStore entry, r
 result_cap            = 500
 listen_stdio          = true
 listen_http           = "127.0.0.1:8765"     # null to disable
-# Disabled by default. When true, exposes destructive database-admin tools:
-# create_database and delete_database. Enable only for trusted/scratch deployments.
+# Disabled by default; local filesystem tools require explicit stdio context.
+enable_database_migration_tools = false
+# Disabled by default. When true, exposes create/delete admin tools.
 enable_database_admin_tools = false
+expose_connection_details = false
+request_timeout_s = 30                         # positive; unary request bound
+primary_failover_retries = 0                   # nonnegative; upstream default if omitted
+migration_schema_size_cap_bytes = 16777216          # 16 MiB
+migration_min_free_bytes = 268435456            # 256 MiB reserve
+migration_shutdown_grace_s = 30
 
 [typedb]
-address     = "127.0.0.1:1729"                  # gRPC host:port; no scheme
+# Exactly one of address, nonempty addresses, or nonempty address_translation.
+address     = "127.0.0.1:1729"                  # host:port; no scheme
+# addresses = ["127.0.0.1:1729"]
+# address_translation = { "public:1729" = "127.0.0.1:1729" }
 tls_enabled = false                             # true for TLS-fronted production servers
+tls_root_ca_path = "/absolute/path/to/ca.pem"  # only valid with TLS enabled
 credentials = { source = "env", username_var = "TYPEDB_USER", password_var = "TYPEDB_PASS" }
 
 [logging]
@@ -856,9 +963,54 @@ refresh — that is the driver's responsibility.
 
 ---
 
+## 9a. Migration worker, coordination, and shutdown contract
+
+Migration jobs are serialized by a process-wide capacity-one permit and a
+shared operation coordinator. Database names are reserved across migration,
+create/delete, and transaction-open paths: local conflicting calls return
+busy rather than waiting, and no second coordinator mutex is held across worker
+awaits. Use one documented acquisition order (admission, session, database
+reservation). Export may coexist with other sessions' existing transactions;
+import reserves a new target and never auto-deletes an externally created one.
+External clients are outside local coordination; upstream collision checks and
+honest uncertainty reporting remain required.
+
+One dedicated native `std::thread` owns a private Tokio runtime and migration
+driver and processes a capacity-one command queue. `MigrationSupervisor` owns
+admission/shutdown state and completion tracking. A queued `Job` owns the
+permit, database reservation, and an owned caller-session mutex guard acquired
+before enqueue; ownership transfers before response waiting, so dropping a
+oneshot receiver cannot release guards. Reconciliation and staging cleanup
+finish before guards release; completion is recorded even when the receiver
+has disappeared. Admission is refused after shutdown begins. Migration uses a
+validated copy of normal connection settings with primary failover retries
+forced to zero; synchronous file/driver operations never run on the Tokio
+reactor.
+
+The reference binary owns the shutdown state machine: `Running ->
+StopAdmission -> Drain -> Completed|Forced`. A shutdown signal stops migration
+admission and cancels HTTP listeners immediately. HTTP drain and migration
+drain run concurrently against one absolute configured deadline, not additive
+timeouts. On success, record terminal worker status and cleanup before joining
+the completed thread; force-close the normal driver afterward. HTTP failure
+exits nonzero even if migration completed. At deadline, abort active HTTP,
+record a sanitized shutdown error, and record forced/uncertain worker outcome
+before closing the normal driver. The reference binary takes the explicit
+`Forced` path with `process::exit(1)`; library code never exits the host
+process. A library supervisor returns explicit `StillRunning`, retains guards
+until real worker completion, and may detach a native thread only as part of
+an embedding host's chosen termination policy. No cancellation path may fake a
+timeout by dropping a blocking worker and releasing reservations, and no
+rollback/cancellation is promised after forced process death.
+
+---
+
 ## 10. Out of scope (for now)
 
 - Server-initiated notifications / idle warnings (see §2).
+- Automatic backups, scheduled exports, TypeDB embedding, server
+  reconfiguration, metrics scraping, or a custom failover engine.
+- HTTP/SSE access to local filesystem migration operations.
 - Nested transactions, savepoints, multiple concurrent transactions per
   session.
 - Query-cost estimation or dry-run mode (TypeDB does not expose these).
@@ -895,10 +1047,11 @@ Three layers, named for the role they play:
    envelope emission happens through methods on this handle so the
    per-session lock is acquired with the right window every time.
 3. **The raw tool router** — `tools::raw_tools_router::<H>`. A generic
-   router over the eleven default tools in §7.0-§7.10 that consumers can mount
+   router over the twelve default tools in §7.0-§7.10 plus §7.10.1 that consumers can mount
    into their `ServerHandler`, with knobs for prefixing names, omitting
    individual tools, and opting into the separately gated database-admin
-   tools (§7.11-§7.12).
+   tools (§7.11-§7.12) or stdio-only migration tools (§7.13-§7.14), with the
+   explicit execution-context and operator-policy checks described in §11.3.
 
 ### 11.2 What a consumer's semantic tool body looks like
 
@@ -932,6 +1085,47 @@ and no hand-built `CallToolResult`. Every invariant from §3 and §5 is
 enforced by the helper.
 
 ### 11.3 The kernel API (sketch)
+
+**Breaking migration API note:** `TypeDbMigrationBackend::new` and the `TypeDbCore::migration_backend` field were removed. `MigrationSupervisor::submit` no longer takes a backend argument; construct it with `MigrationSupervisor::with_factory` and `BackendFactory`. `TypeDbMigrationBackend::connect` performs worker-thread construction using a dedicated driver with retries set to zero.
+
+
+Connection construction uses one validated settings builder shared by
+`TypeDbCore::connect` and binary startup. It accepts exactly one of legacy
+`address`, a nonempty `addresses` list, or a nonempty
+`address_translation` map; conflicting or empty forms fail before connecting.
+It preserves legacy TLS behaviour, optionally accepts an absolute CA path only
+when TLS is enabled, and validates positive unary `request_timeout_s` and
+nonnegative `primary_failover_retries`. The timeout is not an in-transaction
+query or commit deadline, and mutations are never automatically retried.
+The legacy single-address connect entry point remains as a compatibility
+wrapper. Driver address translation/TLS/options must use the published driver
+APIs; no invented protocol dependency or application failover engine is part of
+this contract.
+
+The public immutable execution authority is:
+
+```rust
+pub enum ExecutionContext { Unspecified, Stdio, Http }
+pub trait HasTypeDbCore {
+    fn type_db_core(&self) -> &Arc<TypeDbCore>;
+    fn execution_context(&self) -> ExecutionContext { ExecutionContext::Unspecified }
+}
+```
+
+`TypeDbMcp` stores a private immutable context; `new`/`from_core` retain
+`Unspecified`, while `from_core_with_context`, `for_stdio`, and `for_http`
+set it explicitly. `RawToolsConfig::with_execution_context` defaults to
+`Unspecified`, and `with_database_migration_tools(bool)` is default-off.
+Neither router metadata nor global `listen_stdio` is authority. Migration
+routes are included only for explicit `Stdio` plus the operator flag, and each
+migration handler independently checks immutable handler context and policy
+before session, path, or driver access. HTTP must neither advertise nor
+execute migration routes, including with a stdio-created session ID. Existing
+admin create/delete availability is unchanged. Unchanged custom
+`HasTypeDbCore` implementations compile and deny migrations until opting into
+context. The router and handler must receive and enforce the same context
+(the dual-enforcement invariant).
+
 
 ```rust
 pub struct TypeDbCore {
@@ -1022,7 +1216,7 @@ pub enum TxOutcome<T> {
 The binary's wiring (in `src/main.rs`) becomes one of:
 
 ```rust
-// All eleven default tools, default names.
+// All twelve default tools, default names.
 let raw = tools::raw_tools_router::<MyHandler>(RawToolsConfig::default());
 
 // Or selectively:
@@ -1038,18 +1232,18 @@ let raw_with_admin = tools::raw_tools_router::<MyHandler>(
 );
 ```
 
-The router returned has a `Self` type that depends on the composition
-strategy (see §11.5). The binary's existing `TypeDbMcp` handler stays
-as a thin wrapper around `raw_tools_router::<TypeDbMcp>` so default binary
-behaviour remains the ten-tool surface unless the operator enables the
-admin flag.
+The router returned has the consumer handler's `Self` type. The binary's
+existing `TypeDbMcp` handler stays
+as a thin wrapper around `raw_tools_router::<TypeDbMcp>`; the handler and
+router receive the same immutable execution context and policy, while
+migration routes remain absent unless explicitly enabled for stdio.
 
 ### 11.5 Composing raw tools into a consumer's handler
 
 `rmcp` 1.7's `ToolRouter<S>` can only be merged when both routers
-share the same `S`. This forces a composition choice the library MUST
-document (currently an open question being resolved in the
-implementation PR):
+share the same `S`. The library's supported raw-tool composition is the
+generic-router approach below; consumers may still choose other composition
+patterns when they do not use the kernel raw router:
 
 - **Option A — embed-our-struct.** Consumer's handler holds a
   `TypeDbMcp` field and uses rmcp's multi-router `+` feature to
@@ -1067,8 +1261,14 @@ implementation PR):
   to an internal `TypeDbMcp`. Avoids router-merge entirely. Reasonable
   for consumers with very few semantic tools.
 
-The chosen option is recorded here once the implementation lands; the
-others remain available to consumers with unusual needs.
+The chosen composition is **Option B**: the library exposes
+`pub fn raw_tools_router<H>(config: RawToolsConfig) -> ToolRouter<H>` for the
+consumer's handler type, with free generic function handlers (not closures) as
+required by rmcp's higher-ranked callback bounds. `RawToolsConfig` retains
+prefix and omission knobs, and carries explicit execution context plus
+migration/admin policy. `TypeDbMcp` is the reference thin wrapper and passes
+its immutable context into both the router and handler. Option A/C remain
+possible consumer patterns but are not the kernel's raw-router contract.
 
 ### 11.6 Versioning and stability
 
@@ -1078,6 +1278,13 @@ others remain available to consumers with unusual needs.
   DESIGN.md edit.
 - `rmcp` is a public dependency; the supported version range is
   pinned in the library's `Cargo.toml` and bumped intentionally.
+- `ExecutionContext` is immutable handler authority. `Unspecified` is the
+  compatibility default and denies migration tools; `Stdio`/`Http` must be
+  selected explicitly. Router inclusion and handler checks are both required,
+  so route metadata alone can never grant filesystem authority.
+- `typedb-driver` is pinned exactly to `=3.12.3` for this validated release;
+  connection settings and version-policy changes are intentional contract
+  changes, not runtime dependency introspection.
 - The binary depends on the library at the matching version; the two
   are released in lockstep.
 

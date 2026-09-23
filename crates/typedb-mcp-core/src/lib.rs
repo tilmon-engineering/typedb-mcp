@@ -17,17 +17,27 @@
 //! etc.) so the safety invariants in DESIGN.md §3 hold uniformly.
 
 pub mod config;
+pub mod connection;
+pub mod coordinator;
 pub mod core;
+pub mod diagnostics;
 pub mod envelope;
 pub mod error;
 pub mod extensions;
 pub mod handler;
 pub mod language_reference;
+pub mod migration;
 pub mod session;
 pub mod tools;
 pub mod typedb;
 
-pub use crate::core::{HasTypeDbCore, SessionHandle, TxOutcome, TypeDbCore};
+pub use crate::connection::{
+    DRIVER_VERSION, DriverBuildSettings, SUPPORTED_SERVER_FLOOR, ServerVersionInfo, VersionStatus,
+    connect as connect_with_settings,
+};
+pub use crate::coordinator::{NameReservation, OperationCoordinator, ReservationError};
+pub use crate::core::{ExecutionContext, HasTypeDbCore, SessionHandle, TxOutcome, TypeDbCore};
+pub use crate::diagnostics::{ConnectivityObservation, DiagnosticReport, TopologyServer};
 pub use crate::envelope::{
     AgentEnvelope, ENVELOPE_VERSION, ErrorPayload, NextMoves, envelope_err, envelope_ok,
     envelope_state_error, envelope_state_error_no_session, explain_query_error, extract_codes,
@@ -37,6 +47,10 @@ pub use crate::error::{ErrorClass, InternalError, classify_driver_error, classif
 pub use crate::extensions::Extensions;
 pub use crate::language_reference::{
     TYPEQL_LANGUAGE_REFERENCE, TYPEQL_LANGUAGE_REFERENCE_SHA256, TYPEQL_LANGUAGE_REFERENCE_SOURCE,
+};
+pub use crate::migration::{
+    ImportStatus, Manifest, MigrationBackend, MigrationError, MigrationKind, MigrationReport,
+    MigrationSupervisor, ShutdownResult,
 };
 pub use crate::session::{
     OpenTx, OpenTxView, SessionId, SessionResolveError, SessionSnapshot, SessionState,

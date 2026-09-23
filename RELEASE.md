@@ -1,121 +1,47 @@
 # Release process
 
-Last verified: 2026-06-12 (cutting 0.1.3)
+This repository publishes a multi-architecture container image and four native `typedb-mcp` release archives; it is not a crates.io package. Version/tag changes and deployment are authorized operational actions; do not perform them implicitly.
 
-This repo releases a container image, not a crate. The release artifact
-is `ghcr.io/tilmon-engineering/typedb-mcp`, published by
-`.github/workflows/docker.yml`. There is no crates.io publish and no
-GitHub Release object — an annotated git tag plus the GHCR image *is*
-the release.
+## Native binary release
 
-## How the pipeline works
+`.github/workflows/release.yml` runs only for a pushed `v*` tag. It requires a stable `vX.Y.Z` tag, builds `typedb-mcp` natively on Ubuntu 24.04 x86_64/ARM64 and macOS 15 ARM64/Intel runners, packages one executable named `typedb-mcp` at the root of each gzip tar archive, and creates a draft GitHub Release containing exactly those four archives plus `SHA256SUMS`.
 
-`docker.yml` triggers on two event shapes, and `docker/metadata-action`
-derives image tags from each:
+Before publishing, `verify-draft` downloads the uploaded draft assets and checks exact release asset names, archive members and executable mode, SHA-256 values, checksum formatting, tag, and draft metadata. Only a successful verification allows the draft to be published. `verify-published` then downloads the public release bytes and repeats archive/checksum verification; `verify-release-metadata` independently checks the stable tag, published/non-prerelease state, and exact asset list. A failed verification stops publication or leaves the already-published release visible with a failed Actions run; it does not delete a release.
 
-| Event | Image tags produced |
-|---|---|
-| push to `main` | `latest`, `main`, `sha-<short>` |
-| push of tag `v*` | `<version>` (e.g. `0.1.3`), `<major>.<minor>` (e.g. `0.1`), `sha-<short>` |
-| pull request | build only, no push |
+Run the verifier's local regression tests with:
 
-So every merge to `main` already refreshes `:latest`; the version tag
-exists to pin a semver-addressable image. CI runs **no tests** — it only
-builds and pushes the image. The gated test suite is a local,
-pre-release responsibility (see step 1).
+```bash
+python3 -m unittest discover -s tests -v
+```
 
-## Versioning
+The release workflow does not notify or modify the Homebrew tap. `typedb-mcp` must first be added to the tap's reviewed `tap-projects.json` inventory and have a cask reviewed by tap maintainers. Only after that enrollment, a published release, and configuration of the source repository's narrowly scoped `HOMEBREW_TOOLS_DISPATCH_TOKEN` secret should a separate notification job be added. That job must depend on `publish-release`, `verify-published`, and `verify-release-metadata`; do not dispatch for an unapproved or unverified release.
 
-- Single source of truth: `[workspace.package] version` in the root
-  `Cargo.toml`. All three crates inherit it via `version.workspace = true`.
-- This project uses SemVer for the container image and the in-repo Rust
-  packages. The contract surface is defined in `CHANGELOG.md`'s scope notes:
-  the eleven default agent-facing tools (`DESIGN.md` §7), any explicitly enabled
-  built-in tool surfaces, the response envelope, the transaction state machine,
-  deployment/runtime compatibility promises, and the `typedb-mcp-core` public
-  re-exports (`DESIGN.md` §11).
-- **Major** (`X.0.0`): use for breaking changes once the project reaches
-  `1.0.0`, or for pre-1.0 resets that intentionally signal a new compatibility
-  era. Breaking the agent-facing tool contract, envelope shape, transaction
-  lifecycle, supported TypeDB major/minimum version, image/runtime contract, or
-  public library API requires a `DESIGN.md` update first.
-- **Minor** (`0.Y.0` before 1.0, `X.Y.0` after 1.0): use for compatible new
-  capabilities, new optional tools, new public library APIs, new supported
-  deployment platforms/architectures, or any pre-1.0 breaking contract change.
-  Pre-1.0 breaking changes are minor bumps rather than major bumps, but must be
-  called out clearly in `CHANGELOG.md`.
-- **Patch** (`X.Y.Z`): use for bug fixes, security fixes, dependency updates,
-  test/docs/build-process corrections, and compatible behavior fixes that do
-  not add a new contract capability or remove/reshape an existing one.
-- When in doubt, choose the larger bump and explain why in `CHANGELOG.md`. Never
-  cut a version tag until `main` has already built successfully for every
-  platform that release is meant to publish.
+## Reproducible local release gate
 
-## Cutting a release
+Run from the workspace root:
 
-1. **Green tests, locally.** CI does not run tests, so this gate is on
-   you. From the workspace root, with a live TypeDB 3.12+ on
-   `127.0.0.1:1729` (credentials `admin`/`password`):
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+TYPEDB_MCP_SMOKE=1 bash scripts/compatibility_matrix.sh
+```
 
-   ```bash
-   TYPEDB_MCP_SMOKE=1 cargo test
-   ```
+The compatibility runner starts disposable pinned TypeDB CE 3.12.0 and 3.13.0 containers by default (or versions supplied as arguments), uses dynamically allocated loopback ports, checks authenticated readiness, runs workspace tests, and removes only its own resources. It requires podman or docker and fails with an actionable message if neither is available. Never point migration or matrix runs at production databases.
 
-   All units, the in-process MCP suite, and the driver-level smoke
-   tests must pass. (Note: the local server must be reachable by the
-   rust driver and must be TypeDB 3.12+ for schema annotation metadata;
-   older 3.x servers are outside the supported floor.)
+The checked-in driver is exactly 3.12.3. TypeDB 3.12.0 is the verified floor; TypeDB 3.13.0 is accepted as `unverified` unless the current matrix evidence says otherwise. Do not claim cluster failover, crash atomicity, or backup correctness from this gate.
 
-2. **Update `CHANGELOG.md`.** Move the `[Unreleased]` content into a new
-   `## [X.Y.Z] — YYYY-MM-DD` section, leaving an empty `[Unreleased]`
-   heading behind. Every contract change since the last release must be
-   represented (scope notes at the top of the file).
+## Authorized image/deployment workflow only
 
-3. **Bump the version.** Edit `version` under `[workspace.package]` in
-   the root `Cargo.toml`, then run `cargo build` (or `cargo update -w`)
-   so `Cargo.lock` picks up the new workspace version. Commit the
-   `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md` changes together:
+Only after explicit authorization may an operator publish a version/tag or deploy. The repository’s authorized edge-01 workflow is:
 
-   ```bash
-   git commit -m "Cut X.Y.Z"
-   ```
+1. Publish through the repository CI workflow; do not retag or mutate production images manually.
+2. Restart the edge-01 `typedb-mcp` Deployment through the approved Kubernetes workflow.
+3. Wait for rollout completion.
+4. Verify the running pod’s container image **digest changed**; rollout success alone is not authoritative.
+5. Review startup logs.
+6. Run a live Streamable HTTP smoke against `/mcp`: initialize, `start_session`, `get_schema`, and a read-only transaction flow as appropriate. The smoke must explicitly exclude `export_database` and `import_database` and must not test migration against an existing production database.
 
-   (0.1.2's lockfile refresh landed as a separate commit after the
-   bump; including it in the release commit is the corrected practice
-   so the tag points at a commit whose lockfile matches its version.)
+The exact cluster commands and access prerequisites belong to the authorized operator runbook; this document does not assert that deployment verification has happened. **Deployment verification remains recorded-outstanding until someone performs and records the digest check and live HTTP smoke.**
 
-4. **Tag and push.** Annotated tag, name `vX.Y.Z`, message `vX.Y.Z`:
-
-   ```bash
-   git push origin main
-   git tag -a vX.Y.Z -m "vX.Y.Z"
-   git push origin vX.Y.Z
-   ```
-
-   The main push builds `:latest`; the tag push builds `:X.Y.Z` and
-   `:X.Y`. Watch both:
-
-   ```bash
-   gh run list --repo tilmon-engineering/typedb-mcp --limit 2
-   ```
-
-5. **Roll edge-01.** The deployment pulls `:latest` with
-   `imagePullPolicy: Always`; follow the procedure in `CLAUDE.md`
-   ("Deploying a new image to edge-01"): rollout restart, wait for
-   status, **confirm the image digest changed** (the only authoritative
-   check), then tail the logs for the Streamable HTTP listening line.
-
-6. **Live smoke.** Exercise the changed surface end-to-end against the
-   live MCP (e.g. via the `typedb-*` tools through LiteLLM): at minimum
-   `start_session` → `get_schema` → one read of the affected tool(s).
-   For any task tracked in the OST graph, this is part of the K_* DoD —
-   don't mark it `done` before this passes.
-
-## What a release is not
-
-- No GitHub Release object is created (deliberate; revisit if external
-  consumers appear).
-- No crates.io publish — `typedb-mcp-core`'s library API is consumed
-  via git/path dependencies for now. Publishing would make the
-  `DESIGN.md` §11 stability guarantees externally binding; treat that
-  as a separate decision.
+Do not change the workspace version, create a release tag, push a tag, or announce a release unless explicitly authorized. When authorized, update `CHANGELOG.md`, bump the single workspace version consistently, run the full gate, and tag only the reviewed commit.

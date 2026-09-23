@@ -19,16 +19,15 @@ use typedb_mcp_core::{
     error::ErrorClass,
     typedb::{TxKind, TypeDbClient, query_answer_to_json},
 };
+mod common;
 
 fn enabled() -> bool {
-    std::env::var("TYPEDB_MCP_SMOKE").as_deref() == Ok("1")
+    common::smoke_enabled()
 }
 
 async fn fresh_client_and_db(prefix: &str) -> (TypeDbClient, String) {
-    let client = TypeDbClient::connect("127.0.0.1:1729", "admin", "password", false)
-        .await
-        .expect("connect");
-    let db = format!("{prefix}_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let client = common::connect().await.expect("connect");
+    let db = common::unique_database(prefix);
     client.create_database(&db).await.expect("create");
     (client, db)
 }

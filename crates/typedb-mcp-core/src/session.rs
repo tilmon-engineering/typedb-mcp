@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 //! Per-server-session state and the idle reaper. See DESIGN.md §3 and §4.
 //!
 //! Sessions are minted by the `start_session` tool and identified by a
@@ -59,6 +60,7 @@ impl OpenTx {
     ///
     /// `close()` waits for the server to acknowledge the stream teardown,
     /// so on return the server's view of this tx is gone.
+    #[allow(clippy::result_large_err)]
     pub async fn release(&self) -> Result<(), typedb_driver::Error> {
         match self.kind {
             TxKind::Read => self.transaction.close().await,
@@ -297,7 +299,9 @@ pub async fn run_reaper(
             // doing the purge dance (which may involve await on
             // rollback).
             let purge = {
-                let state = arc.lock().await;
+                // Migration jobs hold an OwnedMutexGuard for their entire
+                // lifetime. Never wait on that guard from the reaper.
+                let Ok(state) = arc.try_lock() else { continue };
                 state.expires_at <= now
             };
             if purge {
@@ -324,7 +328,9 @@ pub async fn run_reaper(
 
             // Second check: tx-idle reaping for sessions that are still
             // alive. Idle timeout is per-kind — reads get a longer leash.
-            let mut state = arc.lock().await;
+            let Ok(mut state) = arc.try_lock() else {
+                continue;
+            };
             let should_reap_tx = state.tx.as_ref().is_some_and(|tx| {
                 let kind_timeout = match tx.kind {
                     crate::typedb::TxKind::Read => read_idle,

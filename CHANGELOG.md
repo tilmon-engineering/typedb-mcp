@@ -8,16 +8,31 @@ The release process is documented in `RELEASE.md`.
 
 Scope notes:
 
-- Changes to the eleven agent-facing tools (`DESIGN.md` §7), the response
+- Changes to the default agent-facing tools (`DESIGN.md` §7), the response
   envelope, the transaction state machine, or the `typedb-mcp-core`
   public re-exports (`DESIGN.md` §11) are **contract changes** and must
   appear here.
 - Internal refactors that do not move those contracts may be summarized
   briefly or omitted.
 
+## [0.3.1] — 2026-09-23
+
+### Added
+
+- Added the twelfth default tool, `server_info`, for bounded version, policy, enabled-tool, and read-only connectivity information.
+- Added opt-in stdio-only `export_database` and `import_database` migration tools with absolute-path validation, staging, no-overwrite publication, checksums, and explicit uncertain/partial outcomes.
+- Added connection settings for address lists/translation, custom TLS roots, unary request timeout, failover retry configuration, diagnostic disclosure, and the 3.12.0+ version policy.
+- Added executable stdio harness coverage and the disposable TypeDB 3.12.0/3.13.0 compatibility runner.
+- Added native four-target binary release archives, checksum manifests, and draft/public release verification.
+
+### Changed
+
+- Pin `typedb-driver` to exactly 3.12.3. TypeDB 3.12.0 is the verified floor; other accepted stable versions are reported `unverified` unless covered by the tested matrix.
+- Documented independent stdio/Streamable HTTP transport policy: migration file tools remain unavailable over HTTP, while existing optional create/delete admin policy is unchanged.
+- Kept the public TypeDB driver error variant source-compatible while narrowing Clippy allowances to the functions that return driver errors.
+
 ## [Unreleased]
 
-_No unreleased changes yet._
 
 ## [0.3.0] — 2026-07-09
 
@@ -34,7 +49,7 @@ _No unreleased changes yet._
 
 - Minimum supported TypeDB/`typedb-driver` version is now 3.12+; schema
   annotation metadata is load-bearing for the reference server contract.
-- The default non-admin raw tool surface is now eleven tools:
+- The default non-admin raw tool surface was eleven tools at this historical release:
   `start_session`, `list_databases`, `get_schema`, `open_read`,
   `open_write`, `open_schema`, `query`, `checkpoint`, `commit`, `rollback`,
   and `read_once`.
@@ -86,10 +101,10 @@ _No unreleased changes yet._
 
 - Optional database-admin raw tools, `create_database` and `delete_database`,
   gated behind `server.enable_database_admin_tools` and omitted from the
-  default ten-tool reference surface. `delete_database` requires explicit
+  then-current default reference surface. `delete_database` requires explicit
   `confirm_database == database` confirmation and rejects while live sessions
   hold transactions on the target database.
-- Exact MCP tool-surface regression tests for both the default ten-tool
+- Exact MCP tool-surface regression tests for both the default
   surface and the admin-enabled surface.
 - Gated in-process regressions for admin-tool safety gates, all schema-read
   gate entry points, schema-gate clearing after schema commits, expired read
@@ -111,7 +126,7 @@ _No unreleased changes yet._
 ### Docs
 
 - `DESIGN.md`, `README.md`, `AGENTS.md`, and config templates now describe
-  the default ten-tool surface plus separately gated database-admin tools.
+  the default surface plus separately gated database-admin tools.
 
 ## [0.1.3] — 2026-06-12
 

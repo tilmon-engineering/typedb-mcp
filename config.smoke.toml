@@ -1,17 +1,25 @@
+# Disposable local smoke configuration. Supply credentials in the environment
+# or replace the inline values only in an uncommitted local copy.
 [server]
-idle_timeout_read_s   = 600
-idle_timeout_write_s  = 60
+idle_timeout_read_s = 600
+idle_timeout_write_s = 60
 idle_timeout_schema_s = 60
-result_cap            = 500
-listen_stdio          = false
-listen_http           = "127.0.0.1:8765"
+session_ttl_s = 3600
+result_cap = 500
+listen_stdio = false
+listen_http = "127.0.0.1:8765"
 enable_database_admin_tools = false
+enable_database_migration_tools = false
+expose_connection_details = false
+migration_schema_size_cap_bytes = 16777216
+migration_min_free_bytes = 268435456
+migration_shutdown_grace_s = 30
 
 [typedb]
-address     = "127.0.0.1:1729"
+address = "127.0.0.1:1729"
 tls_enabled = false
 
 [typedb.credentials]
-source   = "inline"
-username = "admin"
-password = "password"
+source = "env"
+username_var = "TYPEDB_TEST_USERNAME"
+password_var = "TYPEDB_TEST_PASSWORD"
