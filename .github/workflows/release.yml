@@ -4,6 +4,10 @@ on:
   push:
     tags: ["v*"]
 
+concurrency:
+  group: typedb-mcp-release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -70,6 +74,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    outputs:
+      release_id: ${{ steps.create-release.outputs.release_id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -90,75 +96,85 @@ jobs:
             typedb-mcp-x86_64-apple-darwin.tar.gz > SHA256SUMS
           test "$(find . -maxdepth 1 -type f | wc -l)" -eq 5
 
-      - name: Create draft GitHub release
+      - name: Create or resume draft and upload assets
+        id: create-release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release create "${RELEASE_TAG}" \
-            --draft \
-            --verify-tag \
-            --title "${RELEASE_TAG}" \
-            --generate-notes \
-            release-assets/typedb-mcp-x86_64-unknown-linux-gnu.tar.gz \
-            release-assets/typedb-mcp-aarch64-unknown-linux-gnu.tar.gz \
-            release-assets/typedb-mcp-aarch64-apple-darwin.tar.gz \
-            release-assets/typedb-mcp-x86_64-apple-darwin.tar.gz \
-            release-assets/SHA256SUMS
-
-  verify-draft:
-    name: Verify draft release assets
-    needs: [create-draft]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    outputs:
-      release_id: ${{ steps.find-draft.outputs.release_id }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Find the unique draft release for this tag
-        id: find-draft
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          release_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --slurp | jq -er --arg tag "${RELEASE_TAG}" 'add | [.[] | select(.tag_name == $tag and .draft == true) | .id] | if length == 1 then .[0] else error("expected exactly one draft release for tag") end')"
-          [[ "${release_ids}" =~ ^[0-9]+$ ]]
-          echo "release_id=${release_ids}" >> "${GITHUB_OUTPUT}"
-
-      - name: Download draft assets by ID and metadata
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ steps.find-draft.outputs.release_id }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          [[ "${RELEASE_ID}" =~ ^[0-9]+$ ]]
-          mkdir release-assets
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json
-          python3 scripts/verify_release_assets.py --release-json release.json --tag "${RELEASE_TAG}"
+          api="repos/${GITHUB_REPOSITORY}/releases"
+          releases="$(gh api "${api}" --paginate --slurp)"
+          drafts="$(jq -c "add | [.[] | select(.draft == true)][]" <<<"${releases}")"
+          release_json=""
+          while IFS= read -r candidate; do
+            [[ -n "${candidate}" ]] || continue
+            candidate_tag="$(jq -r ".tag_name" <<<"${candidate}")"
+            if [[ "${candidate_tag}" == "${RELEASE_TAG}" ]]; then
+              if [[ -n "${release_json}" ]]; then
+                echo "multiple draft releases already exist for ${RELEASE_TAG}" >&2
+                exit 1
+              fi
+              release_json="${candidate}"
+            fi
+          done <<<"${drafts}"
+          if [[ -z "${release_json}" ]]; then
+            release_json="$(gh api "${api}" --method POST \
+              -F "tag_name=${RELEASE_TAG}" \
+              -F "name=${RELEASE_TAG}" \
+              -F draft=true \
+              -F generate_release_notes=true)"
+          fi
+          release_id="$(jq -er ".id | numbers" <<<"${release_json}")"
+          upload_url="$(jq -er ".upload_url | strings" <<<"${release_json}")"
+          [[ "${release_id}" =~ ^[0-9]+$ ]]
+          release_tag="$(jq -r ".tag_name" <<<"${release_json}")"
+          release_draft="$(jq -r ".draft" <<<"${release_json}")"
+          [[ "${release_tag}" == "${RELEASE_TAG}" ]]
+          [[ "${release_draft}" == "true" ]]
+          upload_base="${upload_url%%\{*}"
           for asset_name in \
             typedb-mcp-x86_64-unknown-linux-gnu.tar.gz \
             typedb-mcp-aarch64-unknown-linux-gnu.tar.gz \
             typedb-mcp-aarch64-apple-darwin.tar.gz \
             typedb-mcp-x86_64-apple-darwin.tar.gz \
             SHA256SUMS; do
-            asset_id="$(jq -er --arg name "${asset_name}" '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("expected one matching asset") end' release.json)"
+            gh api "${api}/${release_id}/assets" > existing-assets.json
+            reuse_existing="$(python3 scripts/check_existing_release_asset.py existing-assets.json "${asset_name}" "release-assets/${asset_name}")"
+            if [[ "${reuse_existing}" == "yes" ]]; then
+              echo "verified existing asset ${asset_name}; resuming upload"
+              continue
+            fi
+            [[ "${reuse_existing}" == "no" ]]
+            curl --fail-with-body --silent --show-error \
+              -X POST \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@release-assets/${asset_name}" \
+              "${upload_base}?name=${asset_name}" > /dev/null
+          done
+          mkdir -p draft-download
+          gh api "${api}/${release_id}" > draft-download/release.json
+          python3 scripts/verify_release_assets.py --release-json draft-download/release.json --tag "${RELEASE_TAG}"
+          for asset_name in \
+            typedb-mcp-x86_64-unknown-linux-gnu.tar.gz \
+            typedb-mcp-aarch64-unknown-linux-gnu.tar.gz \
+            typedb-mcp-aarch64-apple-darwin.tar.gz \
+            typedb-mcp-x86_64-apple-darwin.tar.gz \
+            SHA256SUMS; do
+            asset_id="$(python3 scripts/release_asset_id.py draft-download/release.json "${asset_name}")"
             [[ "${asset_id}" =~ ^[0-9]+$ ]]
             gh api -H "Accept: application/octet-stream" \
-              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-              > "release-assets/${asset_name}"
+              "${api}/assets/${asset_id}" \
+              > "draft-download/${asset_name}"
           done
-
-      - name: Verify draft asset bytes
-        run: python3 scripts/verify_release_assets.py --assets-dir release-assets
+          python3 scripts/verify_release_assets.py --assets-dir draft-download
+          echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
 
   publish-release:
     name: Re-verify and publish release
-    needs: [verify-draft]
+    needs: [create-draft]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -168,7 +184,7 @@ jobs:
       - name: Re-fetch and verify draft immediately before publication
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ needs.verify-draft.outputs.release_id }}
+          RELEASE_ID: ${{ needs.create-draft.outputs.release_id }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -182,7 +198,7 @@ jobs:
             typedb-mcp-aarch64-apple-darwin.tar.gz \
             typedb-mcp-x86_64-apple-darwin.tar.gz \
             SHA256SUMS; do
-            asset_id="$(jq -er --arg name "${asset_name}" '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("expected one matching asset") end' release.json)"
+            asset_id="$(python3 scripts/release_asset_id.py release.json "${asset_name}")"
             [[ "${asset_id}" =~ ^[0-9]+$ ]]
             gh api -H "Accept: application/octet-stream" \
               "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
@@ -193,7 +209,7 @@ jobs:
       - name: Publish re-verified draft release by ID
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: ${{ needs.verify-draft.outputs.release_id }}
+          RELEASE_ID: ${{ needs.create-draft.outputs.release_id }}
         run: |
           set -euo pipefail
           [[ "${RELEASE_ID}" =~ ^[0-9]+$ ]]
