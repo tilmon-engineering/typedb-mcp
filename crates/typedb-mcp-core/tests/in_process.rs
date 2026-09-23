@@ -337,7 +337,11 @@ async fn mcp_admin_tools_reject_current_session_open_transaction() {
     let env = envelope(&result);
     assert_eq!(env["error"]["class"], "TX_ALREADY_OPEN");
 
-    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    let rollback = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the open schema tx"
+    );
     let result = call(
         &client,
         "delete_database",
@@ -400,12 +404,16 @@ async fn mcp_delete_database_rejects_other_session_open_transaction_on_target() 
     let env = envelope(&result);
     assert_eq!(env["error"]["class"], "TX_ALREADY_OPEN");
 
-    let _ = call(
+    let rollback = call(
         &client,
         "rollback",
         with_sid(&sid_open, serde_json::Value::Null),
     )
     .await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the other session's schema tx"
+    );
     let result = call(
         &client,
         "delete_database",
@@ -687,11 +695,11 @@ async fn mcp_full_write_lifecycle() {
     names.sort();
     assert_eq!(names, vec!["first".to_owned(), "second".to_owned()]);
 
-    // Cleanup
-    setup.delete_database(&db).await.unwrap();
-
+    // Stop the in-process service before deleting databases; TypeDB 3.12 can
+    // reject deletion while the server's driver still holds a connection.
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 #[tokio::test]
@@ -764,12 +772,16 @@ async fn mcp_schema_commit_preserves_committer_gate_and_invalidates_other_sessio
         !is_error(&r),
         "committing session should open_write after schema commit without re-reading schema: {r:?}"
     );
-    let _ = call(
+    let rollback = call(
         &client,
         "rollback",
         with_sid(&sid_committer, serde_json::Value::Null),
     )
     .await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the committer's write tx"
+    );
 
     let r = call(
         &client,
@@ -804,16 +816,20 @@ async fn mcp_schema_commit_preserves_committer_gate_and_invalidates_other_sessio
         !is_error(&r),
         "other session should open_write after re-reading schema: {r:?}"
     );
-    let _ = call(
+    let rollback = call(
         &client,
         "rollback",
         with_sid(&sid_other, serde_json::Value::Null),
     )
     .await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the test transaction"
+    );
 
-    setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 #[tokio::test]
@@ -883,10 +899,14 @@ async fn mcp_checkpoint_on_read_tx_returns_tx_is_read_and_leaves_tx_open() {
         "read checkpoint error next_moves mention rollback: {moves:?}"
     );
 
-    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
-    setup.delete_database(&db).await.unwrap();
+    let rollback = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the test transaction"
+    );
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 #[tokio::test]
@@ -982,15 +1002,19 @@ async fn mcp_schema_checkpoint_reopens_and_invalidates_other_sessions() {
     assert!(schema.contains("@doc") || env["result"]["metadata"]["included_in_schema"] == true);
     assert_eq!(env["result"]["schema_metadata_supported"], true);
 
-    let _ = call(
+    let rollback = call(
         &client,
         "rollback",
         with_sid(&sid_committer, serde_json::Value::Null),
     )
     .await;
-    setup.delete_database(&db).await.unwrap();
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the test transaction"
+    );
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 // ---------- 3b. Second open_* while a tx is held returns TX_ALREADY_OPEN ----------
@@ -1054,10 +1078,14 @@ async fn mcp_second_open_returns_tx_already_open() {
     assert_eq!(env["session"]["transaction"]["id"], first_tx_id);
     assert_eq!(env["session"]["transaction"]["kind"], "write");
 
-    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
-    setup.delete_database(&db).await.unwrap();
+    let rollback = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the test transaction"
+    );
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 // ---------- 3c. Parallel read_once on the same session serializes cleanly ----------
@@ -1125,9 +1153,9 @@ async fn mcp_parallel_read_once_serializes() {
         );
     }
 
-    setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 // ---------- 3d. K_00000053 regression: read_once must NOT emit TSV3 ----------
@@ -1227,9 +1255,9 @@ async fn mcp_read_once_does_not_emit_tsv3() {
         assert!(!is_error(&r), "read_once succeeded: {r:?}");
     }
 
-    setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 
     // Inspect captured logs. TSV3 is the canary; the swallowed warn message
     // is the additional signal that someone reverted the wire op.
@@ -1312,9 +1340,9 @@ async fn mcp_expired_read_tx_session_does_not_emit_tsv3() {
     let env = envelope(&r);
     assert_eq!(env["error"]["class"], "SESSION_EXPIRED");
 
-    setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 
     let logs = String::from_utf8(captured.lock().unwrap().clone()).expect("captured logs are utf8");
     assert!(
@@ -1411,9 +1439,9 @@ async fn mcp_read_once_returns_full_multibatch_result() {
         "read_once must return every row, not just the prefetched batch"
     );
 
-    setup.delete_database(&db).await.unwrap();
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 #[tokio::test]
@@ -1500,10 +1528,14 @@ async fn mcp_query_result_cap_keeps_read_tx_usable() {
         "read tx should remain usable after RESULT_LIMIT_EXCEEDED: {r:?}"
     );
 
-    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
-    setup.delete_database(&db).await.unwrap();
+    let rollback = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the test transaction"
+    );
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }
 
 // ---------- 4. Parse error preserves the transaction (recoverable) ----------
@@ -1576,9 +1608,15 @@ async fn mcp_parse_error_keeps_tx_open() {
     )
     .await;
     assert!(!is_error(&r), "post-parse-error insert should succeed");
-    let _ = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    let rollback = call(&client, "rollback", with_sid(&sid, serde_json::Value::Null)).await;
+    assert!(
+        !is_error(&rollback),
+        "rollback should release the test transaction"
+    );
 
-    setup.delete_database(&db).await.unwrap();
+    // Stop the in-process server and release its driver before deleting the
+    // database. TypeDB 3.12 can report DBD2 while that connection is still live.
     drop(client);
     let _ = server_handle.await;
+    setup.delete_database(&db).await.unwrap();
 }

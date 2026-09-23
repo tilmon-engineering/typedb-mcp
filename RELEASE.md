@@ -4,7 +4,7 @@ This repository publishes a multi-architecture container image and four native `
 
 ## Native binary release
 
-`.github/workflows/release.yml` runs only for a pushed `v*` tag. It requires a stable `vX.Y.Z` tag, builds `typedb-mcp` natively on Ubuntu 24.04 x86_64/ARM64 and macOS 15 ARM64/Intel runners, packages one executable named `typedb-mcp` at the root of each gzip tar archive, and creates a draft GitHub Release containing exactly those four archives plus `SHA256SUMS`.
+`.github/workflows/release.yml` runs only for a pushed `v*` tag. It requires a stable `vX.Y.Z` tag exactly matching the `typedb-mcp` workspace package version, builds `typedb-mcp` natively on Ubuntu 24.04 x86_64/ARM64 and macOS 15 ARM64/Intel runners, packages one executable named `typedb-mcp` at the root of each gzip tar archive, and creates a draft GitHub Release containing exactly those four archives plus `SHA256SUMS`.
 
 Before publishing, `verify-draft` downloads the uploaded draft assets and checks exact release asset names, archive members and executable mode, SHA-256 values, checksum formatting, tag, and draft metadata. Only a successful verification allows the draft to be published. `verify-published` then downloads the public release bytes and repeats archive/checksum verification; `verify-release-metadata` independently checks the stable tag, published/non-prerelease state, and exact asset list. A failed verification stops publication or leaves the already-published release visible with a failed Actions run; it does not delete a release.
 

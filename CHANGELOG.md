@@ -15,7 +15,7 @@ Scope notes:
 - Internal refactors that do not move those contracts may be summarized
   briefly or omitted.
 
-## [0.3.1] — 2026-09-23
+## [0.3.2] — 2026-09-23
 
 ### Added
 
@@ -33,6 +33,10 @@ Scope notes:
 
 ## [Unreleased]
 
+
+## [0.3.1] — 2026-09-23
+
+Release attempt superseded by v0.3.2 after the initial automation could not create the draft release because the job lacked a checkout for `gh release create --verify-tag`.
 
 ## [0.3.0] — 2026-07-09
 
