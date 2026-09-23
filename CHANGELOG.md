@@ -15,7 +15,7 @@ Scope notes:
 - Internal refactors that do not move those contracts may be summarized
   briefly or omitted.
 
-## [0.3.6] — 2026-09-23
+## [0.3.7] — 2026-09-23
 
 ### Added
 
@@ -40,7 +40,11 @@ Release attempt superseded by later releases after the initial automation could 
 
 ## [0.3.2] — 2026-09-23
 
-The draft assets were successfully created, but the create job failed after upload because the release-ID selection helper was absent from the committed tree. The draft remains unpublished; v0.3.6 includes the helper and passes its release ID to verification.
+The draft assets were successfully created, but the create job failed after upload because the release-ID selection helper was absent from the committed tree. The draft remains unpublished; a later release includes the helper and passes its release ID to verification.
+
+## [0.3.6] — 2026-09-23
+
+The draft assets and release-ID helper worked, but create-draft's asset verifier included `release.json` alongside the five release assets, so exact-set validation stopped publication. The draft remains unpublished; v0.3.7 stores metadata outside the asset directory.
 
 ## [0.3.0] — 2026-07-09
 
