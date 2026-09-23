@@ -113,42 +113,92 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
+    outputs:
+      release_id: ${{ steps.find-draft.outputs.release_id }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download draft assets and metadata
+      - name: Find the unique draft release for this tag
+        id: find-draft
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          mkdir release-assets
-          gh release download "${RELEASE_TAG}" --dir release-assets
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > release.json
+          release_ids="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --slurp | jq -er --arg tag "${RELEASE_TAG}" 'add | [.[] | select(.tag_name == $tag and .draft == true) | .id] | if length == 1 then .[0] else error("expected exactly one draft release for tag") end')"
+          [[ "${release_ids}" =~ ^[0-9]+$ ]]
+          echo "release_id=${release_ids}" >> "${GITHUB_OUTPUT}"
 
-      - name: Verify draft assets and metadata
+      - name: Download draft assets by ID and metadata
         env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.find-draft.outputs.release_id }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: >-
-          python3 scripts/verify_release_assets.py
-          --assets-dir release-assets
-          --release-json release.json
-          --tag "${RELEASE_TAG}"
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_ID}" =~ ^[0-9]+$ ]]
+          mkdir release-assets
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json
+          python3 scripts/verify_release_assets.py --release-json release.json --tag "${RELEASE_TAG}"
+          for asset_name in \
+            typedb-mcp-x86_64-unknown-linux-gnu.tar.gz \
+            typedb-mcp-aarch64-unknown-linux-gnu.tar.gz \
+            typedb-mcp-aarch64-apple-darwin.tar.gz \
+            typedb-mcp-x86_64-apple-darwin.tar.gz \
+            SHA256SUMS; do
+            asset_id="$(jq -er --arg name "${asset_name}" '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("expected one matching asset") end' release.json)"
+            [[ "${asset_id}" =~ ^[0-9]+$ ]]
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "release-assets/${asset_name}"
+          done
+
+      - name: Verify draft asset bytes
+        run: python3 scripts/verify_release_assets.py --assets-dir release-assets
 
   publish-release:
-    name: Publish verified release
+    name: Re-verify and publish release
     needs: [verify-draft]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
-      - name: Publish draft release
+      - uses: actions/checkout@v4
+
+      - name: Re-fetch and verify draft immediately before publication
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.verify-draft.outputs.release_id }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release edit "${RELEASE_TAG}" --draft=false
+          [[ "${RELEASE_ID}" =~ ^[0-9]+$ ]]
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > release.json
+          python3 scripts/verify_release_assets.py --release-json release.json --tag "${RELEASE_TAG}"
+          mkdir release-assets
+          for asset_name in \
+            typedb-mcp-x86_64-unknown-linux-gnu.tar.gz \
+            typedb-mcp-aarch64-unknown-linux-gnu.tar.gz \
+            typedb-mcp-aarch64-apple-darwin.tar.gz \
+            typedb-mcp-x86_64-apple-darwin.tar.gz \
+            SHA256SUMS; do
+            asset_id="$(jq -er --arg name "${asset_name}" '[.assets[] | select(.name == $name)] | if length == 1 then .[0].id else error("expected one matching asset") end' release.json)"
+            [[ "${asset_id}" =~ ^[0-9]+$ ]]
+            gh api -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "release-assets/${asset_name}"
+          done
+          python3 scripts/verify_release_assets.py --assets-dir release-assets
+
+      - name: Publish re-verified draft release by ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ needs.verify-draft.outputs.release_id }}
+        run: |
+          set -euo pipefail
+          [[ "${RELEASE_ID}" =~ ^[0-9]+$ ]]
+          gh api --method PATCH -F draft=false \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" >/dev/null
 
   verify-published:
     name: Verify published release assets

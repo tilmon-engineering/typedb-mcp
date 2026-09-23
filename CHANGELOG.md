@@ -15,7 +15,7 @@ Scope notes:
 - Internal refactors that do not move those contracts may be summarized
   briefly or omitted.
 
-## [0.3.2] — 2026-09-23
+## [0.3.3] — 2026-09-23
 
 ### Added
 
@@ -23,7 +23,7 @@ Scope notes:
 - Added opt-in stdio-only `export_database` and `import_database` migration tools with absolute-path validation, staging, no-overwrite publication, checksums, and explicit uncertain/partial outcomes.
 - Added connection settings for address lists/translation, custom TLS roots, unary request timeout, failover retry configuration, diagnostic disclosure, and the 3.12.0+ version policy.
 - Added executable stdio harness coverage and the disposable TypeDB 3.12.0/3.13.0 compatibility runner.
-- Added native four-target binary release archives, checksum manifests, and draft/public release verification.
+- Added native four-target binary release archives, checksum manifests, and draft/public release verification using draft-release and asset IDs.
 
 ### Changed
 
@@ -36,7 +36,11 @@ Scope notes:
 
 ## [0.3.1] — 2026-09-23
 
-Release attempt superseded by v0.3.2 after the initial automation could not create the draft release because the job lacked a checkout for `gh release create --verify-tag`.
+Release attempt superseded by later releases after the initial automation could not create the draft release because the job lacked a checkout for `gh release create --verify-tag`.
+
+## [0.3.2] — 2026-09-23
+
+The draft assets were successfully created, but draft verification queried the draft by tag through an endpoint that returns published releases only. The draft was intentionally left unpublished; a subsequent release verifies draft assets through their release and asset IDs before publication.
 
 ## [0.3.0] — 2026-07-09
 
