@@ -34,6 +34,12 @@ Scope notes:
 ## [Unreleased]
 
 
+## [0.3.8] — 2026-09-24
+
+### Changed
+
+- Notify the enrolled Homebrew tap only after the published release assets and metadata pass verification.
+
 ## [0.3.1] — 2026-09-23
 
 Release attempt superseded by later releases after the initial automation could not create the draft release because the job lacked a checkout for `gh release create --verify-tag`.

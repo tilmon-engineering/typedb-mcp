@@ -262,3 +262,28 @@ jobs:
           --release-json release.json
           --tag "${RELEASE_TAG}"
           --expect-published
+
+  notify-homebrew-tap:
+    name: Notify Homebrew tap
+    needs: [publish-release, verify-published, verify-release-metadata]
+    if: ${{ success() }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Notify the enrolled tap
+        env:
+          DISPATCH_TOKEN: ${{ secrets.HOMEBREW_TOOLS_DISPATCH_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REPOSITORY}" == "tilmon-engineering/typedb-mcp" ]]
+          [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          [[ -n "${DISPATCH_TOKEN}" ]]
+          curl --fail-with-body --silent --show-error \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${DISPATCH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://api.github.com/repos/tilmon-engineering/homebrew-tools/dispatches \
+            -d "{\"event_type\":\"homebrew-tools-release\",\"client_payload\":{\"repository\":\"${GITHUB_REPOSITORY}\",\"tag\":\"${RELEASE_TAG}\"}}"

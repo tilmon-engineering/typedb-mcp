@@ -14,7 +14,7 @@ Run the verifier's local regression tests with:
 python3 -m unittest discover -s tests -v
 ```
 
-The release workflow does not notify or modify the Homebrew tap. `typedb-mcp` must first be added to the tap's reviewed `tap-projects.json` inventory and have a cask reviewed by tap maintainers. Only after that enrollment, a published release, and configuration of the source repository's narrowly scoped `HOMEBREW_TOOLS_DISPATCH_TOKEN` secret should a separate notification job be added. That job must depend on `publish-release`, `verify-published`, and `verify-release-metadata`; do not dispatch for an unapproved or unverified release.
+`typedb-mcp` is enrolled in the tap's reviewed `tap-projects.json` inventory and has a maintainer-reviewed cask. The release workflow's `notify-homebrew-tap` job dispatches only after `publish-release`, `verify-published`, and `verify-release-metadata` all succeed, using the source repository's narrowly scoped `HOMEBREW_TOOLS_DISPATCH_TOKEN` secret. A notification failure remains visible without deleting or rolling back the already-published release; rerun that job or use the tap's replay/reconciliation path after fixing access.
 
 ## Reproducible local release gate
 
